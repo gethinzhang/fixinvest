@@ -11,7 +11,6 @@ from hi5 import (
     InMemoryStorageEngine,
     LocalStorageEngine,
     BacktestAnalyzer,
-    BenchmarkAnalyzer,
 )
 import pytz
 
@@ -98,7 +97,8 @@ def setup_cerebro(strategy_tickers):
     cerebro = bt.Cerebro(stdstats=False)
     
     # Setup Hi5 strategy state
-    storage_engine = LocalStorageEngine(local_file_path="./hi5_strategy_state.json")
+    # storage_engine = LocalStorageEngine(local_file_path="./hi5_strategy_state.json")
+    storage_engine = InMemoryStorageEngine()
     hi5_state = Hi5State(storage_engine=storage_engine)
 
     # Add Hi5 strategy
@@ -107,9 +107,9 @@ def setup_cerebro(strategy_tickers):
         state=hi5_state, 
         tickers=strategy_tickers,
         enable_cash_injection=True,  # Enable for backtesting
-        cash_injection_threshold=3,  # Maintain 3x cash_per_contribution
+        cash_injection_threshold=5,  # Maintain 3x cash_per_contribution
         cash_per_contribution=10000,
-        non_resident_tax_rate=0,  # Set to 0 for US residents, 0.3 for non-residents
+        non_resident_tax_rate=0.3,  # Set to 0 for US residents, 0.3 for non-residents
     )
 
     # Setup broker
@@ -119,9 +119,6 @@ def setup_cerebro(strategy_tickers):
     # Add analyzers
     cerebro.addanalyzer(
         BacktestAnalyzer, _name="hi5analyzer", risk_free_rate=RISK_FREE_RATE
-    )
-    cerebro.addanalyzer(
-        BenchmarkAnalyzer, _name="benchmark", risk_free_rate=RISK_FREE_RATE
     )
     
     return cerebro
@@ -166,7 +163,6 @@ def print_results(strategy_instance):
     """Print comprehensive backtest results"""
     # Get analysis results
     hi5_analysis = strategy_instance.analyzers.hi5analyzer.get_analysis()
-    benchmark_analysis = strategy_instance.analyzers.benchmark.get_benchmark_analysis()
     final_positions = strategy_instance.analyzers.hi5analyzer.final_positions
 
     print("\n" + "="*60)
@@ -178,17 +174,6 @@ def print_results(strategy_instance):
     print(f"Sharpe Ratio: {hi5_analysis.get('sharpe_ratio', 0):.2f}")
     print(f"Annual IRR: {hi5_analysis.get('annual_irr', 0)*100:.2f}%")
     print(f"Max Drawdown: {hi5_analysis.get('max_drawdown', 0)*100:.2f}%")
-
-    # Benchmark Results
-    print(f"\n--- Benchmark (Buy & Hold) Performance ---")
-    print(f"Annual IRR: {benchmark_analysis.get('benchmark_annual_irr', 0)*100:.2f}%")
-    print(f"Sharpe Ratio: {benchmark_analysis.get('benchmark_sharpe_ratio', 0):.2f}")
-    print(f"Max Drawdown: {benchmark_analysis.get('benchmark_max_drawdown', 0)*100:.2f}%")
-
-    # Performance Comparison
-    excess_return = hi5_analysis.get('annual_irr', 0) - benchmark_analysis.get('benchmark_annual_irr', 0)
-    print(f"\n--- Performance Comparison ---")
-    print(f"Excess Return vs Benchmark: {excess_return*100:.2f}%")
 
     # Portfolio Summary
     if final_positions:
@@ -245,21 +230,21 @@ def run_backtest():
     print("Initializing backtest...")
     
     # Strategy configuration
-    strategy_tickers = ["IWY", "RSP", "MOAT", "PFF", "VNQ"]
-    
-    # Setup cerebro
+    strategy_tickers = ["VUG", "VO", "MOAT", "PFF", "VNQ"]
+    benchmark_tickers = ["RSP"]
+
+    # Download data for all tickers (trading + benchmark)
+    all_tickers = strategy_tickers + benchmark_tickers
     cerebro = setup_cerebro(strategy_tickers)
-    
-    # Download data
-    print(f"Downloading data for {len(strategy_tickers)} tickers...")
-    data_dict = download_multiple_tickers(strategy_tickers, START_DATE, END_DATE)
+    print(f"Downloading data for {len(all_tickers)} tickers...")
+    data_dict = download_multiple_tickers(all_tickers, START_DATE, END_DATE)
     
     if not data_dict:
         print("Error: No data downloaded. Exiting.")
         return
     
     # Add data feeds
-    feeds_added = add_data_feeds(cerebro, strategy_tickers, data_dict)
+    feeds_added = add_data_feeds(cerebro, all_tickers, data_dict)
     if feeds_added == 0:
         print("Error: No data feeds added. Exiting.")
         return
@@ -280,13 +265,11 @@ def run_backtest():
         
         # Export to Excel
         hi5_analysis = strategy_instance.analyzers.hi5analyzer.get_analysis()
-        benchmark_analysis = strategy_instance.analyzers.benchmark.get_benchmark_analysis()
         
         excel_file = strategy_instance.analyzers.hi5analyzer.export_to_excel(
             tickers=strategy_tickers,
             start_date=START_DATE,
             end_date=END_DATE,
-            benchmark_analysis=benchmark_analysis,
         )
         print(f"\nDetailed results exported to: {excel_file}")
         
@@ -308,7 +291,6 @@ def try_plot_results(cerebro):
                 style="candlestick", 
                 barup="green", 
                 bardown="red", 
-                benchmarkname="RSP"
             )
         else:
             cerebro.plot(style="candlestick", barup="green", bardown="red")

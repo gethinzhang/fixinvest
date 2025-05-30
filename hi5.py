@@ -199,6 +199,12 @@ class BacktestAnalyzer(bt.Analyzer):
         self.trade_history = []  # 用于存储所有交易和股息事件
         self.portfolio_values = []
         self.dates = []
+        
+        # Track cash and stock values separately
+        self.cash_values = []  # Track cash portion
+        self.stock_values = []  # Track stock portion
+        self.portfolio_history = []  # Track detailed portfolio breakdown
+        
         self.monthly_returns = []  # Track monthly returns instead of daily
         self.monthly_portfolio_values = []  # Track end-of-month portfolio values
         self.monthly_dates = []  # Track end-of-month dates
@@ -277,7 +283,6 @@ class BacktestAnalyzer(bt.Analyzer):
         
         # Track dividend cash for reference
         self.total_dividend_cash += net_amount
-
         self.record_investment(date, -net_amount, "Dividend")
 
     def next(self):
@@ -286,9 +291,47 @@ class BacktestAnalyzer(bt.Analyzer):
             return
 
         current_date = self.strategy.datetime.date(0)  # 使用strategy的datetime
-        portfolio_value = self.strategy.broker.getvalue()  # This includes stocks + cash
+        
+        # Use cumulative dividend cash for correct cash value
+        cash_value = self.strategy.broker.get_cash() + self.total_dividend_cash
+        
+        # Calculate total stock value by summing all positions
+        stock_value = 0.0
+        position_details = {}
+        
+        for data in self.strategy.datas:
+            position = self.strategy.getposition(data)
+            if position.size > 0:
+                current_price = data.close[0]
+                position_value = position.size * current_price
+                stock_value += position_value
+                
+                position_details[data._name] = {
+                    'shares': position.size,
+                    'price': current_price,
+                    'value': position_value
+                }
+        
+        # Total portfolio value
+        portfolio_value = cash_value + stock_value
+        
+        # Store all values
         self.portfolio_values.append(portfolio_value)
+        self.cash_values.append(cash_value)  # This now includes dividends from _check_dividends
+        self.stock_values.append(stock_value)
         self.dates.append(current_date)
+        
+        # Store detailed portfolio breakdown
+        portfolio_detail = {
+            'date': current_date,
+            'cash': cash_value,
+            'stocks': stock_value,
+            'total': portfolio_value,
+            'cash_pct': (cash_value / portfolio_value * 100) if portfolio_value > 0 else 0,
+            'stocks_pct': (stock_value / portfolio_value * 100) if portfolio_value > 0 else 0,
+            'positions': position_details
+        }
+        self.portfolio_history.append(portfolio_detail)
 
         # Track monthly returns instead of daily returns
         current_month = (current_date.year, current_date.month)
@@ -315,6 +358,75 @@ class BacktestAnalyzer(bt.Analyzer):
             if self.monthly_portfolio_values:
                 self.monthly_portfolio_values[-1] = portfolio_value
                 self.monthly_dates[-1] = current_date
+
+    def get_analysis(self):
+        if not self.dates or not self.portfolio_values:
+            return {
+                "sharpe_ratio": 0.0,
+                "monthly_irr": 0.0,
+                "annual_irr": 0.0,
+                "max_drawdown": 0.0,
+                "total_investor_deposits": 0.0,
+                "trades": pd.DataFrame(),
+                "portfolio_values": pd.DataFrame(),
+                "portfolio_history": pd.DataFrame(),
+            }
+
+        # Calculate monthly and annual IRR based on real investor deposits
+        monthly_irr, annual_irr = self.calculate_monthly_irr()
+        if monthly_irr is None:
+            monthly_irr = 0.0
+        if annual_irr is None:
+            annual_irr = 0.0
+
+        # Sharpe Ratio based on monthly returns
+        sharpe_ratio = 0.0
+        if len(self.monthly_returns) > 1:
+            returns_np = np.array(self.monthly_returns)
+            monthly_risk_free = (1 + self.p.risk_free_rate) ** (1/12) - 1
+            
+            excess_returns = returns_np - monthly_risk_free
+            sharpe_ratio = np.sqrt(12) * (np.mean(excess_returns) / np.std(excess_returns))
+
+        # Max Drawdown
+        max_drawdown = 0.0
+        if len(self.portfolio_values) > 0:
+            portfolio_values_np = np.array(self.portfolio_values)
+            peak = np.maximum.accumulate(portfolio_values_np)
+            non_zero_peak_indices = peak != 0
+            drawdown = np.zeros_like(portfolio_values_np, dtype=float)
+            drawdown[non_zero_peak_indices] = (
+                peak[non_zero_peak_indices] - portfolio_values_np[non_zero_peak_indices]
+            ) / peak[non_zero_peak_indices]
+            if len(drawdown) > 0:
+                max_drawdown = np.max(drawdown)
+
+        # Trades DataFrame
+        self.trade_history.sort(key=lambda x: x["date"])
+        trades_df = pd.DataFrame(self.trade_history)
+
+        return {
+            "sharpe_ratio": sharpe_ratio,
+            "monthly_irr": monthly_irr,
+            "annual_irr": annual_irr,
+            "max_drawdown": max_drawdown,
+            "total_investor_deposits": self.total_investor_deposits,
+            "investment_schedule": self.investment_schedule,
+            "trades": trades_df,
+            "portfolio_values_df": pd.DataFrame(
+                {"Date": self.dates, "Portfolio Value": self.portfolio_values}
+            ),
+            "portfolio_history_df": pd.DataFrame({
+                "Date": self.dates,
+                "Total Value": self.portfolio_values,
+                "Cash": self.cash_values,
+                "Stocks": self.stock_values,
+                "Cash %": [(cash / total * 100) if total > 0 else 0 for cash, total in zip(self.cash_values, self.portfolio_values)],
+                "Stocks %": [(stock / total * 100) if total > 0 else 0 for stock, total in zip(self.stock_values, self.portfolio_values)]
+            }),
+            "monthly_returns": self.monthly_returns,
+            "monthly_dates": self.monthly_dates[1:] if len(self.monthly_dates) > 1 else [],  # Skip first date since no return calculated
+        }
 
     def calculate_irr_cash_flows(self):
         """Calculate cash flows for IRR using REAL investor deposits"""
@@ -420,66 +532,6 @@ class BacktestAnalyzer(bt.Analyzer):
         except:
             return None, None
 
-    def get_analysis(self):
-        if not self.dates or not self.portfolio_values:
-            return {
-                "sharpe_ratio": 0.0,
-                "monthly_irr": 0.0,
-                "annual_irr": 0.0,
-                "max_drawdown": 0.0,
-                "total_investor_deposits": 0.0,
-                "trades": pd.DataFrame(),
-                "portfolio_values": pd.DataFrame(),
-            }
-
-        # Calculate monthly and annual IRR based on real investor deposits
-        monthly_irr, annual_irr = self.calculate_monthly_irr()
-        if monthly_irr is None:
-            monthly_irr = 0.0
-        if annual_irr is None:
-            annual_irr = 0.0
-
-        # Sharpe Ratio based on monthly returns
-        sharpe_ratio = 0.0
-        if len(self.monthly_returns) > 1:
-            returns_np = np.array(self.monthly_returns)
-            if np.std(returns_np) != 0:
-                monthly_risk_free = (1 + self.p.risk_free_rate) ** (1/12) - 1
-                excess_returns = returns_np - monthly_risk_free
-                sharpe_ratio = np.sqrt(12) * (np.mean(excess_returns) / np.std(excess_returns))
-
-        # Max Drawdown
-        max_drawdown = 0.0
-        if len(self.portfolio_values) > 0:
-            portfolio_values_np = np.array(self.portfolio_values)
-            peak = np.maximum.accumulate(portfolio_values_np)
-            non_zero_peak_indices = peak != 0
-            drawdown = np.zeros_like(portfolio_values_np, dtype=float)
-            drawdown[non_zero_peak_indices] = (
-                peak[non_zero_peak_indices] - portfolio_values_np[non_zero_peak_indices]
-            ) / peak[non_zero_peak_indices]
-            if len(drawdown) > 0:
-                max_drawdown = np.max(drawdown)
-
-        # Trades DataFrame
-        self.trade_history.sort(key=lambda x: x["date"])
-        trades_df = pd.DataFrame(self.trade_history)
-
-        return {
-            "sharpe_ratio": sharpe_ratio,
-            "monthly_irr": monthly_irr,
-            "annual_irr": annual_irr,
-            "max_drawdown": max_drawdown,
-            "total_investor_deposits": self.total_investor_deposits,
-            "investment_schedule": self.investment_schedule,
-            "trades": trades_df,
-            "portfolio_values_df": pd.DataFrame(
-                {"Date": self.dates, "Portfolio Value": self.portfolio_values}
-            ),
-            "monthly_returns": self.monthly_returns,
-            "monthly_dates": self.monthly_dates[1:] if len(self.monthly_dates) > 1 else [],  # Skip first date since no return calculated
-        }
-
     def capture_final_positions(self, strategy):
         """Capture final positions from the strategy including dividend tracking"""
         self.final_positions = []
@@ -555,7 +607,7 @@ class BacktestAnalyzer(bt.Analyzer):
                 'Total P&L %': 0,
             })
 
-    def export_to_excel(self, tickers, start_date, end_date, benchmark_analysis=None, filename=None):
+    def export_to_excel(self, tickers, start_date, end_date, filename=None):
         """Enhanced Excel export using REAL investor deposits for all calculations"""
         
         # Generate filename if not provided
@@ -658,8 +710,32 @@ class BacktestAnalyzer(bt.Analyzer):
             worksheet.set_column('C:C', 10)  # Type column
             worksheet.set_column('D:H', 12)  # Numeric columns
         
-        # Calculate metrics using REAL investor deposits
+        # Export portfolio history with cash and stock breakdown
         analysis_results = self.get_analysis()
+        portfolio_history_df = analysis_results['portfolio_history_df']
+        
+        if not portfolio_history_df.empty:
+            # Select only the four columns we want
+            portfolio_history_df = portfolio_history_df[['Date', 'Total Value', 'Cash', 'Stocks']]
+            portfolio_history_df.to_excel(writer, sheet_name='Portfolio History', index=False)
+            worksheet = writer.sheets['Portfolio History']
+            
+            # Format headers
+            for col_num, value in enumerate(portfolio_history_df.columns.values):
+                worksheet.write(0, col_num, value, header_format)
+            
+            # Apply formatting to data
+            for idx, row in portfolio_history_df.iterrows():
+                worksheet.write(idx + 1, 0, row['Date'], date_format)  # Date
+                worksheet.write(idx + 1, 1, row['Total Value'], currency_format)  # Total Value
+                worksheet.write(idx + 1, 2, row['Cash'], currency_format)  # Cash
+                worksheet.write(idx + 1, 3, row['Stocks'], currency_format)  # Stocks
+            
+            # Adjust column widths
+            worksheet.set_column('A:A', 15)  # Date column
+            worksheet.set_column('B:D', 15)  # Value columns
+
+        # Calculate metrics using REAL investor deposits
         annual_irr = analysis_results['annual_irr']
         max_drawdown = analysis_results['max_drawdown']
         sharpe_ratio = analysis_results['sharpe_ratio']
@@ -722,45 +798,7 @@ class BacktestAnalyzer(bt.Analyzer):
             total_dividends_gross - total_dividend_tax,
             net_profit
         ]
-        
-        # Add benchmark data if available
-        if benchmark_analysis:
-            metrics_list.extend([
-                '--- BENCHMARK (Buy & Hold) ---',
-                'Benchmark Initial Investment',
-                'Benchmark Final Value',
-                'Benchmark Total Return',
-                'Benchmark Annual IRR',
-                'Benchmark Max Drawdown',
-                'Benchmark Sharpe Ratio',
-                'Benchmark Dividends (Gross)',
-                'Benchmark Dividend Tax',
-                'Benchmark Dividends (Net)',
-                '--- COMPARISON ---',
-                'Excess Return vs Benchmark',
-                'IRR Difference vs Benchmark',
-                'Risk-Adjusted Excess Return'
-            ])
-            
-            benchmark_values = [
-                '---',
-                benchmark_analysis.get('benchmark_initial_investment', 0),
-                benchmark_analysis.get('benchmark_final_value', 0),
-                benchmark_analysis.get('benchmark_total_return', 0),
-                benchmark_analysis.get('benchmark_annual_irr', 0),
-                benchmark_analysis.get('benchmark_max_drawdown', 0),
-                benchmark_analysis.get('benchmark_sharpe_ratio', 0),
-                benchmark_analysis.get('benchmark_dividend_gross', 0),
-                benchmark_analysis.get('benchmark_dividend_tax', 0),
-                benchmark_analysis.get('benchmark_dividend_net', 0),
-                '---',
-                total_return - benchmark_analysis.get('benchmark_total_return', 0),
-                annual_irr - benchmark_analysis.get('benchmark_annual_irr', 0),
-                (annual_irr - benchmark_analysis.get('benchmark_annual_irr', 0)) / max(max_drawdown, 0.01)
-            ]
-            
-            hi5_values.extend(benchmark_values)
-        
+             
         # Export comprehensive metrics
         metrics_data = {
             'Metric': metrics_list,
@@ -797,28 +835,15 @@ class BacktestAnalyzer(bt.Analyzer):
             for col_num, value in enumerate(cash_flow_df.columns.values):
                 worksheet.write(0, col_num, value, header_format)
         
-        # Export portfolio values as separate sheet
-        portfolio_df = pd.DataFrame({"Date": self.dates, "Portfolio Value": self.portfolio_values})
-        if not portfolio_df.empty:
-            portfolio_df.to_excel(writer, sheet_name='Portfolio Values', index=False)
-            worksheet = writer.sheets['Portfolio Values']
-            for col_num, value in enumerate(portfolio_df.columns.values):
-                worksheet.write(0, col_num, value, header_format)
-            worksheet.set_column('A:A', 15)
-            worksheet.set_column('B:B', 20)
-        
         # Save the Excel file
         writer.close()
         print(f"Results exported to {filename}")
         print(f"Total investor deposits required: ${total_investor_deposits:,.2f}")
         print(f"Final portfolio value: ${final_value:,.2f}")
+        print(f"Final cash: ${self.cash_values[-1]:,.2f} ({self.cash_values[-1]/final_value*100:.1f}%)")
+        print(f"Final stocks: ${self.stock_values[-1]:,.2f} ({self.stock_values[-1]/final_value*100:.1f}%)")
         print(f"Annual IRR (on deposits): {annual_irr:.2%}")
         print(f"Net profit: ${net_profit:,.2f}")
-        
-        if benchmark_analysis:
-            benchmark_irr = benchmark_analysis.get('benchmark_annual_irr', 0)
-            print(f"Benchmark Annual IRR: {benchmark_irr:.2%}")
-            print(f"Excess Return vs Benchmark: {(annual_irr - benchmark_irr):.2%}")
         
         return filename
 
@@ -830,11 +855,12 @@ class Hi5Strategy(bt.Strategy):
         ("market_breadth_days", 120),  # 未使用
         ("non_resident_tax_rate", 0.3),
         ("extreme_condition_invest_factor", 2),  # 未使用
-        ("tickers", ["IWY", "RSP", "MOAT", "PFF", "VNQ"]),  # 原始 Tickers
+        ("tickers", ["VUG", "VO", "MOAT", "PFF", "VNQ"]),  # <--- UPDATED
+        ("benchmark_tickers", ["RSP"]),  # <--- NEW: for calculation only
         ("min_period", 14),  # K线最小周期
-        ("state_storage_path", "hi5_strategy_state.json"),  # 状态存储文件路径
-        ("enable_cash_injection", True),  # Enable on-demand cash injection for backtesting
-        ("cash_injection_threshold", 3),  # Minimum cash = threshold * cash_per_contribution
+        ("state_storage_path", "hi5_strategy_state.json"),
+        ("enable_cash_injection", True),
+        ("cash_injection_threshold", 3),
     )
 
     def __init__(self, state: Hi5State):  # state 通过外部注入
@@ -852,16 +878,14 @@ class Hi5Strategy(bt.Strategy):
         print(f'{dt.isoformat()}: {txt}')
 
     def start(self):
-        # 在开始时找到RSP的data feed
+        # Find RSP data feed for benchmark logic
+        self.rsp_data = None
         for data in self.datas:
-            if data._name == "RSP":  # 假设RSP是其中一个ticker
+            if data._name == "RSP":
                 self.rsp_data = data
                 break
-        if self.rsp_data is None and "RSP" in self.p.tickers:
-            self.log(
-                "CRITICAL: RSP data feed not found in provided datas, but RSP is in tickers."
-            )
-            # 可以在这里决定是否停止策略，或者让其在next()中处理
+        # If RSP is not found, crash immediately
+        assert self.rsp_data is not None, "RSP data feed (benchmark_ticker) is required but not found!"
 
         # 尝试恢复状态（如果Hi5State的__init__没有自动做的话）
         # self.state.restore_state() # 已在Hi5State的__init__中调用
@@ -922,7 +946,7 @@ class Hi5Strategy(bt.Strategy):
                 net_dividend = gross_total_dividend - tax_amount
 
                 # Backtrader 自动将税前股息添加到现金。我们需要手动扣除税款。
-                self.broker.add_cash(-tax_amount)
+                self.broker.add_cash(net_dividend)
                 
                 # Track net dividend cash received
                 self.total_dividend_cash_received += net_dividend
@@ -949,28 +973,29 @@ class Hi5Strategy(bt.Strategy):
                             pos.size,
                         )
 
-    def buy_etfs(self, reason):
+    def buy_etfs(self, reason, multiplier=1):
         self.log(
             f"Attempting contribution: {reason}. Cash before: ${self.broker.get_cash():.2f}, Dividend cash: ${self.total_dividend_cash_received:.2f}"
         )
 
         # Record this as an investment that requires external deposit
         current_date = self.datetime.date(0)
+        this_time_invest_amout = self.p.cash_per_contribution * multiplier
         
         # Notify analyzer about the investment requirement
         for analyzer in self.analyzers:
             if hasattr(analyzer, "record_investment"):
                 analyzer.record_investment(
                     current_date,
-                    self.p.cash_per_contribution,
+                    this_time_invest_amout,
                     reason
                 )
 
-        target_investment_per_ticker = self.p.cash_per_contribution / len(
+        target_investment_per_ticker = this_time_invest_amout / len(
             self.p.tickers
         )
 
-        cash_needed_for_full_contribution = self.p.cash_per_contribution
+        cash_needed_for_full_contribution = this_time_invest_amout
         available_cash = self.broker.get_cash()
 
         if (
@@ -1096,61 +1121,28 @@ class Hi5Strategy(bt.Strategy):
         self._check_dividends()
 
         # 2. 确保有足够的历史数据
-        if len(self.datas[0]) < self.p.min_period:  # 假设所有数据长度相似
-            # 或者检查 self.rsp_data 的长度
-            if self.rsp_data and len(self.rsp_data) < self.p.min_period:
-                return
+        if len(self.datas[0]) < self.p.min_period or len(self.rsp_data) < self.p.min_period:
+            return
 
         # 3. 月度状态刷新
-        # 确保 self.rsp_data 已经初始化
-        if self.rsp_data is None:
-            if "RSP" in self.p.tickers:  # 只有当RSP应该存在时才报错
-                self.log(
-                    f"RSP data feed not available at {current_date}. Cannot proceed with month-dependent logic."
-                )
-            # 如果RSP不是必须的，或者没有这个ticker，这里的逻辑需要调整
-            # 暂时假设如果RSP不在tickers里，则不依赖它
-            # 如果依赖，则应该在start()中就处理好，或在此处返回
-            if "RSP" in self.p.tickers:
-                return  # 如果RSP是必须的但未找到，则无法继续
-            else:  # 如果RSP不是策略的一部分，则使用self.datas[0]进行月份判断
-                if (
-                    self.state.current_month is None
-                    or self.state.current_month != current_date.month
-                ):
-                    self.state.refresh_to_new_month(
-                        self.datas[0]
-                    )  # 使用第一个data feed进行月份刷新
-                    self.log(
-                        f"Month refreshed using {self.datas[0]._name}. New month: {self.state.current_month}. RSP Start Price (if applicable): {self.state.rsp_month_start_price}"
-                    )
-
-        elif (
-            self.state.current_month is None
-            or self.state.current_month != current_date.month
-        ):
-            self.state.refresh_to_new_month(
-                self.rsp_data
-            )  # 使用RSP data feed进行月份刷新
+        if self.state.current_month is None or self.state.current_month != current_date.month:
+            self.state.refresh_to_new_month(self.rsp_data)
             self.log(
                 f"Month refreshed using RSP. New month: {self.state.current_month}. RSP Month Start Price: {self.state.rsp_month_start_price}"
             )
 
-        # 4. 获取RSP价格 (如果RSP是策略的一部分)
+        # 4. 获取RSP价格
         rsp_prev_close = None
         rsp_today_close = None
-        if self.rsp_data and len(self.rsp_data) >= 2:  # 确保有至少两天数据
+        if len(self.rsp_data) >= 2:
             rsp_prev_close = self.rsp_data.close[-1]
             rsp_today_close = self.rsp_data.close[0]
-        elif "RSP" in self.p.tickers:  # 如果RSP是必须的，但数据不足
-            self.log(f"Insufficient RSP data at {current_date} for price checks.")
-            # 根据策略重要性，可能需要在此处 return
 
         # 5. 执行定投逻辑 (依赖RSP的逻辑)
-        if "RSP" in self.p.tickers and rsp_today_close is not None:  # 确保RSP数据有效
+        if rsp_today_close is not None:
             # 5.1. 第一次定投: RSP日跌幅 ≤ -1% 或 第三周末尾
             if not self.state.first_exec:
-                if rsp_prev_close is not None and rsp_prev_close > 0:  # 确保分母不为0
+                if rsp_prev_close is not None and rsp_prev_close > 0:
                     drawback = (rsp_today_close / rsp_prev_close) - 1
                     if drawback <= -0.01:
                         self.buy_etfs("RSP daily drop <= -1%")
@@ -1158,29 +1150,20 @@ class Hi5Strategy(bt.Strategy):
                     elif self.is_third_week_end():
                         self.buy_etfs("Fallback on 3rd week end")
                         self.state.first_exec = True
-                elif (
-                    self.is_third_week_end()
-                ):  # 如果没有前一天收盘价（例如数据第一天），但符合第三周条件
+                elif self.is_third_week_end():
                     self.buy_etfs("Fallback on 3rd week end (no prev_close)")
                     self.state.first_exec = True
 
             # 5.2. 第二次定投: RSP月内跌幅 ≤ -5%
-            if not self.state.second_exec:  # 每天都检查，直到执行或月底
+            if not self.state.second_exec:
                 if (
                     self.state.rsp_month_start_price is not None
                     and self.state.rsp_month_start_price > 0
                 ):
                     mtd_ret = (rsp_today_close / self.state.rsp_month_start_price) - 1
                     if mtd_ret <= -0.05:
-                        self.buy_etfs("RSP MTD drop <= -5%")
-                        self.state.second_exec = (
-                            True  # 一旦执行，本月不再执行第二次定投
-                        )
-                # 注意：原代码中 self.state.second_exec = True 在if条件之外，这意味着无论是否买入，
-                # 只要这个block被执行过一次（即rsp_month_start_price有效），second_exec就会变True。
-                # 我已将其移入if mtd_ret <= -0.05内部，表示只有成功触发买入后才标记为已执行。
-                # 如果原意是"本月只检查一次MTD条件，无论是否买入"，则应保持在外部。
-                # 当前的逻辑是：如果条件满足，买入并标记；如果不满足，下一天继续检查。
+                        self.buy_etfs("RSP MTD drop <= -5%", multiplier=3)
+                        self.state.second_exec = True
 
         # 6. 第三次定投: 极端事件 (TODO)
         if not self.state.third_exec:
@@ -1188,15 +1171,9 @@ class Hi5Strategy(bt.Strategy):
             pass
 
         # 7. 年度再平衡: 8月第一个交易日
-        # current_date.month == 1 and self.state.rebalanced_this_year_august = False (已移到refresh_to_new_month)
         if current_date.month == 8 and not self.state.rebalanced_this_year_august:
-            # 检查是否是8月的第一个交易日
-            # (self.datetime.date(-1) 是上一个bar的日期)
-            if (
-                self.datetime.date(-1).month == 7
-            ):  # 如果上一个bar是7月，那么今天是8月第一个交易日
+            if self.datetime.date(-1).month == 7:
                 self.rebalance()
-                # self.state.rebalanced_this_year_august = True # 已在rebalance方法内设置
 
         # 8. 保存状态
         self.state.save_state()
@@ -1226,193 +1203,3 @@ class Hi5Strategy(bt.Strategy):
             self.log(f"Net External Cash (Injected - Dividends): ${net_external_cash:.2f}")
         
         self.state.save_state()
-
-
-class BenchmarkAnalyzer(bt.Analyzer):
-    """Benchmark analyzer for 'Buy At First then Hold' strategy"""
-    params = (
-        ("risk_free_rate", 0.04),
-    )
-    
-    def __init__(self):
-        super().__init__()
-        self.portfolio_values = []
-        self.dates = []
-        self.monthly_returns = []  # Track monthly returns instead of daily
-        self.monthly_portfolio_values = []
-        self.monthly_dates = []
-        self.last_month = None
-        self.initial_investment = 0.0
-        self.benchmark_invested = False
-        self.total_dividend_gross = 0.0
-        self.total_dividend_tax = 0.0
-        self.trade_history = []
-
-    def next(self):
-        if not hasattr(self, "strategy") or self.strategy is None:
-            return
-
-        current_date = self.strategy.datetime.date(0)
-        
-        # On first day with sufficient data, make initial investment
-        if not self.benchmark_invested and len(self.strategy.datas[0]) >= self.strategy.p.min_period:
-            self.make_initial_investment()
-            self.benchmark_invested = True
-        
-        # Track portfolio values
-        portfolio_value = self.strategy.broker.getvalue()
-        self.portfolio_values.append(portfolio_value)
-        self.dates.append(current_date)
-        
-        # Track monthly returns instead of daily returns
-        current_month = (current_date.year, current_date.month)
-        
-        # If this is a new month or the first data point
-        if self.last_month is None:
-            self.last_month = current_month
-            self.monthly_portfolio_values.append(portfolio_value)
-            self.monthly_dates.append(current_date)
-        elif current_month != self.last_month:
-            # New month detected - calculate monthly return
-            if len(self.monthly_portfolio_values) > 0:
-                prev_value = self.monthly_portfolio_values[-1]
-                if prev_value > 0:
-                    monthly_return = (portfolio_value / prev_value) - 1
-                    self.monthly_returns.append(monthly_return)
-            
-            # Update monthly tracking
-            self.monthly_portfolio_values.append(portfolio_value)
-            self.monthly_dates.append(current_date)
-            self.last_month = current_month
-        else:
-            # Same month - update the current month's portfolio value
-            if self.monthly_portfolio_values:
-                self.monthly_portfolio_values[-1] = portfolio_value
-                self.monthly_dates[-1] = current_date
-        
-        # Track dividends (same logic as main strategy)
-        self.track_benchmark_dividends()
-
-    def make_initial_investment(self):
-        """Make equal-weighted initial investment in all tickers"""
-        available_cash = self.strategy.broker.get_cash()
-        self.initial_investment = available_cash
-        
-        # Equal weight allocation
-        allocation_per_ticker = available_cash / len(self.strategy.p.tickers)
-        
-        for data in self.strategy.datas:
-            if data._name in self.strategy.p.tickers:
-                price = data.close[0]
-                if price > 0:
-                    size_to_buy = int(allocation_per_ticker / price)
-                    if size_to_buy > 0:
-                        # Record the benchmark trade
-                        trade_info = {
-                            "date": self.strategy.datetime.date(0),
-                            "ticker": data._name,
-                            "type": "BUY",
-                            "price": price,
-                            "size": size_to_buy,
-                            "value": size_to_buy * price,
-                            "commission": 0,  # Assume no commission for benchmark
-                            "reason": "Benchmark Initial Investment"
-                        }
-                        self.trade_history.append(trade_info)
-
-    def track_benchmark_dividends(self):
-        """Track dividends for benchmark calculation (for reference only)"""
-        current_date = self.strategy.datetime.date(0)
-        
-        for data in self.strategy.datas:
-            if (hasattr(data, "dividends") and data.dividends[0] is not None and data.dividends[0] > 0):
-                pos = self.strategy.getposition(data)
-                if pos.size > 0:
-                    gross_dividend_per_share = data.dividends[0]
-                    gross_total_dividend = pos.size * gross_dividend_per_share
-                    tax_amount = gross_total_dividend * self.strategy.p.non_resident_tax_rate
-                    
-                    self.total_dividend_gross += gross_total_dividend
-                    self.total_dividend_tax += tax_amount
-                    
-                    # Record dividend event
-                    dividend_info = {
-                        "date": current_date,
-                        "ticker": data._name,
-                        "type": "DIVIDEND",
-                        "price": gross_dividend_per_share,
-                        "size": pos.size,
-                        "value": gross_total_dividend,
-                        "commission": tax_amount,
-                        "reason": f"Benchmark Dividend"
-                    }
-                    self.trade_history.append(dividend_info)
-
-                    # record cashflow
-                    
-
-    def get_benchmark_analysis(self):
-        """Calculate benchmark performance metrics"""
-        if not self.dates or not self.portfolio_values or not self.initial_investment:
-            return {
-                "benchmark_sharpe_ratio": 0.0,
-                "benchmark_monthly_irr": 0.0,
-                "benchmark_annual_irr": 0.0,
-                "benchmark_max_drawdown": 0.0,
-                "benchmark_total_return": 0.0,
-                "benchmark_initial_investment": 0.0,
-                "benchmark_final_value": 0.0,
-                "benchmark_dividend_gross": 0.0,
-                "benchmark_dividend_tax": 0.0,
-                "benchmark_dividend_net": 0.0
-            }
-
-        # Sharpe Ratio based on monthly returns
-        sharpe_ratio = 0.0
-        if len(self.monthly_returns) > 1:
-            returns_np = np.array(self.monthly_returns)
-            if np.std(returns_np) != 0:
-                monthly_risk_free = (1 + self.p.risk_free_rate) ** (1/12) - 1
-                excess_returns = returns_np - monthly_risk_free
-                sharpe_ratio = np.sqrt(12) * (np.mean(excess_returns) / np.std(excess_returns))
-
-        # Monthly and Annual IRR (simple CAGR approach)
-        monthly_irr = 0.0
-        annual_irr = 0.0
-        if len(self.dates) > 1 and self.initial_investment > 0:
-            final_value = self.portfolio_values[-1]
-            total_months = (self.dates[-1].year - self.dates[0].year) * 12 + (self.dates[-1].month - self.dates[0].month)
-            if total_months > 0:
-                total_return = (final_value / self.initial_investment) - 1
-                monthly_irr = (1 + total_return) ** (1 / total_months) - 1
-                annual_irr = (1 + monthly_irr) ** 12 - 1
-
-        # Max Drawdown
-        max_drawdown = 0.0
-        if len(self.portfolio_values) > 0:
-            portfolio_values_np = np.array(self.portfolio_values)
-            peak = np.maximum.accumulate(portfolio_values_np)
-            non_zero_peak_indices = peak != 0
-            drawdown = np.zeros_like(portfolio_values_np, dtype=float)
-            drawdown[non_zero_peak_indices] = (
-                peak[non_zero_peak_indices] - portfolio_values_np[non_zero_peak_indices]
-            ) / peak[non_zero_peak_indices]
-            if len(drawdown) > 0:
-                max_drawdown = np.max(drawdown)
-
-        # Total Return
-        final_value = self.portfolio_values[-1]
-        total_return = (final_value - self.initial_investment) / self.initial_investment if self.initial_investment > 0 else 0
-
-        return {
-            "benchmark_sharpe_ratio": sharpe_ratio,
-            "benchmark_monthly_irr": monthly_irr,
-            "benchmark_annual_irr": annual_irr,
-            "benchmark_max_drawdown": max_drawdown,
-            "benchmark_total_return": total_return,
-            "benchmark_initial_investment": self.initial_investment,
-            "benchmark_final_value": final_value,
-            "benchmark_dividend_gross": self.total_dividend_gross,
-            "benchmark_dividend_tax": self.total_dividend_tax,
-            "benchmark_dividend_net": self.total_dividend_gross - self.total_dividend_tax
-        }
