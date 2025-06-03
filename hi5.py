@@ -8,6 +8,12 @@ import json
 from abc import abstractmethod
 import os  # 用于LocalStorageEngine检查文件路径
 
+# Add Google Cloud Storage
+try:
+    from google.cloud import storage
+except ImportError:
+    storage = None
+
 
 class Hi5PandasDataWithDividends(bt.feeds.PandasData):
     lines = ("dividends",)
@@ -86,6 +92,60 @@ class InMemoryStorageEngine(Hi5StateStorageEngine):
 
     def save(self):
         pass  # 内存引擎的"保存"是即时的，不需要显式操作
+
+    def get(self, key, default=None):
+        return self.data.get(key, default)
+
+    def set(self, key, value):
+        self.data[key] = value
+
+
+class GCPStorageEngine(Hi5StateStorageEngine):
+    def __init__(self, bucket_name, blob_name, credentials_path=None):
+        if storage is None:
+            raise RuntimeError("google-cloud-storage is not installed. GCPStorageEngine cannot be used. Please install google-cloud-storage or choose a different engine.")
+
+        try:
+            # Initialize the GCP client
+            if credentials_path and os.path.exists(credentials_path):
+                self.client = storage.Client.from_service_account_json(credentials_path)
+            else:
+                self.client = storage.Client()
+
+            # Get bucket and blob
+            self.bucket = self.client.bucket(bucket_name)
+            self.blob = self.bucket.blob(blob_name)
+
+            # Verify bucket exists
+            if not self.bucket.exists():
+                raise RuntimeError(f"Bucket {bucket_name} does not exist. Please create it first.")
+
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize GCP client: {e}. Please check your GCP credentials and configuration.")
+
+    def load(self):
+        try:
+            if self.blob.exists():
+                content = self.blob.download_as_string().decode('utf-8')
+                if content:
+                    self.data = json.loads(content)
+                else:
+                    self.data = {}
+            else:
+                print(f"GCP blob {self.blob.name} does not exist in bucket {self.bucket.name}. Initializing empty state.")
+                self.data = {}
+        except Exception as e:
+            print(f"Error loading state from GCP: {e}. Initializing with empty state.")
+            self.data = {}
+
+    def save(self):
+        try:
+            self.blob.upload_from_string(
+                json.dumps(self.data, indent=4),
+                content_type='application/json'
+            )
+        except Exception as e:
+            print(f"Error saving state to GCP: {e}")
 
     def get(self, key, default=None):
         return self.data.get(key, default)
@@ -320,7 +380,7 @@ class BacktestAnalyzer(bt.Analyzer):
         self.cash_values.append(cash_value)  # This now includes dividends from _check_dividends
         self.stock_values.append(stock_value)
         self.dates.append(current_date)
-        
+
         # Store detailed portfolio breakdown
         portfolio_detail = {
             'date': current_date,
@@ -931,7 +991,7 @@ class Hi5Strategy(bt.Strategy):
             
             self.log(
                 f"Cash injection: ${cash_to_inject:.2f} (Before: ${current_cash:.2f}, After: ${self.broker.get_cash():.2f}, Total injected: ${self.total_cash_injected:.2f}, Dividend cash: ${self.total_dividend_cash_received:.2f})"
-            )
+        )
 
     def _check_dividends(self):
         current_date = self.datetime.date(0)
@@ -939,39 +999,40 @@ class Hi5Strategy(bt.Strategy):
             pos = self.getposition(data)
             if pos.size > 0:  # 只有持仓时才处理股息
                 gross_dividend_per_share = data.dividends[0]
-                if gross_dividend_per_share <= 0:
-                    continue
-                gross_total_dividend = pos.size * gross_dividend_per_share
-                tax_amount = gross_total_dividend * self.p.non_resident_tax_rate
-                net_dividend = gross_total_dividend - tax_amount
+            if gross_dividend_per_share <= 0:
+                continue
+            
+            gross_total_dividend = pos.size * gross_dividend_per_share
+            tax_amount = gross_total_dividend * self.p.non_resident_tax_rate
+            net_dividend = gross_total_dividend - tax_amount
 
-                # Backtrader 自动将税前股息添加到现金。我们需要手动扣除税款。
-                self.broker.add_cash(net_dividend)
+            # Backtrader 自动将税前股息添加到现金。我们需要手动扣除税款。
+            self.broker.add_cash(net_dividend)
                 
-                # Track net dividend cash received
-                self.total_dividend_cash_received += net_dividend
+            # Track net dividend cash received
+            self.total_dividend_cash_received += net_dividend
 
-                # 更新 Hi5State 中的累计股息和税款
-                self.state.total_dividends_gross += gross_total_dividend
-                self.state.total_tax_paid_on_dividends += tax_amount
+            # 更新 Hi5State 中的累计股息和税款
+            self.state.total_dividends_gross += gross_total_dividend
+            self.state.total_tax_paid_on_dividends += tax_amount
 
-                self.log(
-                    f"Dividend for {data._name}: {pos.size} shares * ${gross_dividend_per_share:.4f}/share = "
-                    f"Gross ${gross_total_dividend:.2f}, Tax ${tax_amount:.2f}, Net ${net_dividend:.2f}. Cash: {self.broker.get_cash():.2f}, Total div cash: ${self.total_dividend_cash_received:.2f}"
-                )
+            self.log(
+                f"Dividend for {data._name}: {pos.size} shares * ${gross_dividend_per_share:.4f}/share = "
+                f"Gross ${gross_total_dividend:.2f}, Tax ${tax_amount:.2f}, Net ${net_dividend:.2f}. Cash: {self.broker.get_cash():.2f}, Total div cash: ${self.total_dividend_cash_received:.2f}"
+            )
 
-                # 通知分析器
-                # 检查是否有附加的分析器并且它有 add_dividend_event 方法
-                for analyzer in self.analyzers:
-                    if hasattr(analyzer, "add_dividend_event"):
-                        analyzer.add_dividend_event(
-                            current_date,
-                            data._name,
-                            gross_total_dividend,
-                            tax_amount,
-                            net_dividend,
-                            pos.size,
-                        )
+            # 通知分析器
+            # 检查是否有附加的分析器并且它有 add_dividend_event 方法
+            for analyzer in self.analyzers:
+                if hasattr(analyzer, "add_dividend_event"):
+                    analyzer.add_dividend_event(
+                        current_date,
+                        data._name,
+                        gross_total_dividend,
+                        tax_amount,
+                        net_dividend,
+                        pos.size,
+                    )
 
     def buy_etfs(self, reason, multiplier=1):
         self.log(
@@ -1072,9 +1133,9 @@ class Hi5Strategy(bt.Strategy):
                 size_to_buy = int(additional_value / data.close[0])
                 if size_to_buy > 0:
                     order = self.buy(data=data, size=size_to_buy)
-                    if order:
-                        order.reason = "annual_rebalance"
-                        self.log(
+            if order:
+                order.reason = "annual_rebalance"
+                self.log(
                             f"Rebalance BUY Order: {size_to_buy} shares of {data._name} to reach target value of ${target_value_per_ticker:.2f}"
                         )
             elif current_value > target_value_per_ticker:
@@ -1122,7 +1183,7 @@ class Hi5Strategy(bt.Strategy):
 
         # 2. 确保有足够的历史数据
         if len(self.datas[0]) < self.p.min_period or len(self.rsp_data) < self.p.min_period:
-            return
+                return
 
         # 3. 月度状态刷新
         if self.state.current_month is None or self.state.current_month != current_date.month:
