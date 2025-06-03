@@ -19,7 +19,7 @@ RUN pip install --no-cache-dir -r requirements_live.txt
 COPY hi5.py .
 COPY live_trader_offline.py .
 COPY gcp_config.json .
-COPY smtp_config.json .
+#COPY smtp_config.json .
 #COPY gcp-credentials.json .
 
 # Create directory for credentials
