@@ -822,7 +822,7 @@ def main():
     parser.add_argument(
         "--smtp-config",
         help="Path to SMTP config file (default: smtp_config.json)",
-        default="smtp_config.json",
+        default="smtp-config.json",
     )
     parser.add_argument(
         "--test-date", help="Test date in YYYY-MM-DD format (e.g., 2024-01-15)"
@@ -836,7 +836,7 @@ def main():
     parser.add_argument(
         "--gcp-config",
         help="Path to GCP config file (default: gcp_config.json)",
-        default="gcp_config.json",
+        default="gcp-config.json",
     )
 
     args = parser.parse_args()
