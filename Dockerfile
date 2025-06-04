@@ -35,5 +35,5 @@ RUN chown -R appuser:appuser /app
 USER appuser
 
 # Command to run the application
-ENTRYPOINT ["/app/entrypoint.sh"]
-CMD ["--engine", "gcp", "--email", "zgxcassar@gmail.com"]
+# ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["bash", "/app/entrypoint.sh", "--engine", "gcp", "--email", "zgxcassar@gmail.com"]
