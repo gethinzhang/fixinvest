@@ -50,27 +50,45 @@ class EmailManager:
     def create_calendar_invitation(self, plan: TradingPlan) -> bytes:
         """Create an ICS file for the trading plan"""
         cal = icalendar.Calendar()
-        cal.add("prodid", "-//Hi5 Trading Plan//EN")
-        cal.add("version", "2.0")
+        cal.add('prodid', '-//Hi5 Trading Plan//EN')
+        cal.add('version', '2.0')
+        cal.add('method', 'REQUEST')  # Add method REQUEST for calendar invitations
 
         # Create event
         event = icalendar.Event()
-        event.add("summary", f"Hi5 Trade: {plan.action} {plan.shares} {plan.ticker}")
+        event.add('summary', f'Hi5 Trade: {plan.action} {plan.shares} {plan.ticker}')
+        #event.add('status', 'CONFIRMED')  # Add status
+        #event.add('transp', 'OPAQUE')  # Add transparency
+        #event.add('sequence', 0)  # Add sequence number
 
-        # Set time to 9:45 AM ET on next trading day
-        et_tz = pytz.timezone("America/New_York")
+        # Set time to 8:30 AM ET on next trading day
+        et_tz = pytz.timezone('America/New_York')
         event_date = plan.date
         while event_date.weekday() >= 5:  # Skip weekends
             event_date += datetime.timedelta(days=1)
-
+        
         start_time = et_tz.localize(
-            datetime.datetime.combine(event_date.date(), datetime.time(9, 45))
+            datetime.datetime.combine(event_date.date(), datetime.time(8, 30))
         )
+
         end_time = start_time + datetime.timedelta(minutes=30)
 
-        event.add("dtstart", start_time)
-        event.add("dtend", end_time)
-        event.add("dtstamp", datetime.datetime.now())
+        event.add('dtstart', start_time)
+        event.add('dtend', end_time)
+        event.add('dtstamp', datetime.datetime.now(pytz.UTC))  # Add timezone
+        event.add('created', datetime.datetime.now(pytz.UTC))  # Add creation time
+        event.add('last-modified', datetime.datetime.now(pytz.UTC))  # Add last modified
+
+        # Add organizer
+        event.add('organizer', f'MAILTO:{self.smtp_username}')
+        event.add('attendee', f'MAILTO:{self.smtp_username}')
+
+        # Add alarm/reminder 30 minutes before
+        alarm = icalendar.Alarm()
+        alarm.add('action', 'DISPLAY')
+        alarm.add('description', f'Reminder: Hi5 Trade {plan.action} {plan.shares} {plan.ticker}')
+        alarm.add('trigger', datetime.timedelta(minutes=-30))
+        event.add_component(alarm)
 
         # Add description
         description = f"""Hi5 Trading Plan
@@ -94,7 +112,7 @@ Pre-Trade Checklist:
 
 Remember: This is a plan, not a commitment. Adjust based on market conditions.
 """
-        event.add("description", description)
+        event.add('description', description)
 
         # Add to calendar
         cal.add_component(event)
@@ -105,10 +123,10 @@ Remember: This is a plan, not a commitment. Adjust based on market conditions.
         """Send calendar invitation via email"""
         try:
             # Create message
-            msg = MIMEMultipart()
-            msg["Subject"] = f"Hi5 Trading Plan: {plan.action} {plan.ticker}"
-            msg["From"] = self.smtp_username
-            msg["To"] = recipient_email
+            msg = MIMEMultipart('mixed')
+            msg['Subject'] = f'Hi5 Trading Plan: {plan.action} {plan.ticker}'
+            msg['From'] = self.smtp_username
+            msg['To'] = recipient_email
 
             # Add text body
             body = f"""Hi5 Trading Plan
@@ -132,14 +150,15 @@ Pre-Trade Checklist:
 
 Remember: This is a plan, not a commitment. Adjust based on market conditions.
 """
-            msg.attach(MIMEText(body, "plain"))
+            msg.attach(MIMEText(body, 'plain'))
 
             # Add calendar invitation
             ics_data = self.create_calendar_invitation(plan)
-            part = MIMEBase("text", "calendar", method="REQUEST")
+            part = MIMEBase('text', 'calendar', method='REQUEST')
             part.set_payload(ics_data)
             encoders.encode_base64(part)
-            part.add_header("Content-Disposition", "attachment; filename=invite.ics")
+            part.add_header('Content-Type', 'text/calendar; method=REQUEST; charset=UTF-8')
+            part.add_header('Content-Disposition', 'attachment; filename=invite.ics')
             msg.attach(part)
 
             # Send email
@@ -235,19 +254,39 @@ Remember: This is a plan, not a commitment. Adjust based on market conditions.
     ) -> bytes:
         """Create an ICS file for all trading plans for a day"""
         cal = icalendar.Calendar()
-        cal.add("prodid", "-//Hi5 Trading Plan//EN")
-        cal.add("version", "2.0")
+        cal.add('prodid', '-//Hi5 Trading Plan//EN')
+        cal.add('version', '2.0')
+        cal.add('method', 'REQUEST')  # Add method REQUEST for calendar invitations
+
         event = icalendar.Event()
-        event.add("summary", f"Hi5 Trading Plan for {trading_day.strftime('%Y-%m-%d')}")
-        et_tz = pytz.timezone("America/New_York")
-        # Set time to 9:45 AM ET
+        event.add('summary', f'Hi5 Trading Plan for {trading_day.strftime("%Y-%m-%d")}')
+        #event.add('status', 'CONFIRMED')  # Add status
+        #event.add('transp', 'OPAQUE')  # Add transparency
+        #event.add('sequence', 0)  # Add sequence number
+
+        et_tz = pytz.timezone('America/New_York')
+        # Set time to 8:30 AM ET
         start_time = et_tz.localize(
-            datetime.datetime.combine(trading_day.date(), datetime.time(9, 45))
+            datetime.datetime.combine(trading_day.date(), datetime.time(8, 30))
         )
         end_time = start_time + datetime.timedelta(minutes=30)
-        event.add("dtstart", start_time)
-        event.add("dtend", end_time)
-        event.add("dtstamp", datetime.datetime.now())
+        event.add('dtstart', start_time)
+        event.add('dtend', end_time)
+        event.add('dtstamp', datetime.datetime.now(pytz.UTC))  # Add timezone
+        event.add('created', datetime.datetime.now(pytz.UTC))  # Add creation time
+        event.add('last-modified', datetime.datetime.now(pytz.UTC))  # Add last modified
+
+        # Add organizer
+        event.add('organizer', f'MAILTO:{self.smtp_username}')
+        event.add('attendee', f'MAILTO:{self.smtp_username}')
+
+        # Add alarm/reminder 30 minutes before
+        alarm = icalendar.Alarm()
+        alarm.add('action', 'DISPLAY')
+        alarm.add('description', f'Reminder: Hi5 Trading Plan for {trading_day.strftime("%Y-%m-%d")}')
+        alarm.add('trigger', datetime.timedelta(minutes=-30))
+        event.add_component(alarm)
+
         # Build description
         description = "Hi5 Trading Plan\n\n"
         for plan in plans:
@@ -260,7 +299,7 @@ Remember: This is a plan, not a commitment. Adjust based on market conditions.
             "□ Set limit order if high volatility\n"
             "□ Document actual execution price\n"
         )
-        event.add("description", description)
+        event.add('description', description)
         cal.add_component(event)
         return cal.to_ical()
 
@@ -273,24 +312,29 @@ Remember: This is a plan, not a commitment. Adjust based on market conditions.
     ):
         """Send a single calendar invitation for all trades on a day, with HTML summary as the main body"""
         try:
-            msg = MIMEMultipart("mixed")
-            msg["Subject"] = f"Hi5 Trading Plan: {trading_day.strftime('%Y-%m-%d')}"
-            msg["From"] = self.smtp_username
-            msg["To"] = recipient_email
+            msg = MIMEMultipart('mixed')
+            msg['Subject'] = f'Hi5 Trading Plan: {trading_day.strftime("%Y-%m-%d")}'
+            msg['From'] = self.smtp_username
+            msg['To'] = recipient_email
+
             # Add HTML summary as the main body
-            msg.attach(MIMEText(html_summary, "html"))
+            msg.attach(MIMEText(html_summary, 'html'))
+
             # Add calendar invitation
             ics_data = self.create_daily_calendar_invitation(plans, trading_day)
-            part = MIMEBase("text", "calendar", method="REQUEST")
+            part = MIMEBase('text', 'calendar', method='REQUEST')
             part.set_payload(ics_data)
             encoders.encode_base64(part)
-            part.add_header("Content-Disposition", "attachment; filename=invite.ics")
+            part.add_header('Content-Type', 'text/calendar; method=REQUEST; charset=UTF-8')
+            part.add_header('Content-Disposition', 'attachment; filename=invite.ics')
             msg.attach(part)
+
             # Send email
             with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
                 server.starttls()
                 server.login(self.smtp_username, self.smtp_password)
                 server.send_message(msg)
+
             print(f"Daily calendar invitation (with summary) sent to {recipient_email}")
             return True
         except Exception as e:
@@ -451,6 +495,7 @@ class OfflineTradingPlanner:
                             "%Y-%m-%d"
                         ),
                         progress=False,
+                        auto_adjust=True,
                     )
                     closes = df["Close"].loc[: prev_trading_day.strftime("%Y-%m-%d")]
                     if len(closes) < 1:
@@ -821,7 +866,7 @@ def main():
     parser.add_argument("--email", help="Email address for notifications")
     parser.add_argument(
         "--smtp-config",
-        help="Path to SMTP config file (default: smtp_config.json)",
+        help="Path to SMTP config file (default: smtp-config.json)",
         default="smtp-config.json",
     )
     parser.add_argument(

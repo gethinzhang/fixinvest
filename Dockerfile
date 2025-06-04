@@ -36,4 +36,4 @@ USER appuser
 
 # Command to run the application
 # ENTRYPOINT ["/app/entrypoint.sh"]
-CMD ["bash", "/app/entrypoint.sh", "--engine", "gcp", "--email", "zgxcassar@gmail.com"]
+CMD ["bash", "/app/entrypoint.sh", "--email", "zgxcassar@gmail.com"]
