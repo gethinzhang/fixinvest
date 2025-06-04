@@ -19,6 +19,8 @@ RUN pip install --no-cache-dir -r requirements_live.txt
 COPY hi5.py .
 COPY live_trader_offline.py .
 COPY gcp-config.json .
+COPY entrypoint.sh .
+RUN chmod +x entrypoint.sh
 
 # Create directory for credentials
 RUN mkdir -p /app/credentials
@@ -33,4 +35,5 @@ RUN chown -R appuser:appuser /app
 USER appuser
 
 # Command to run the application
-CMD ["python", "live_trader_offline.py", "--engine", "gcp", "--email", "zgxcassar@gmail.com"] 
+ENTRYPOINT ["entrypoint.sh"]
+CMD ["--engine", "gcp", "--email", "zgxcassar@gmail.com"]
