@@ -1228,8 +1228,15 @@ class Hi5Strategy(bt.Strategy):
 
         # 6. 第三次定投: 极端事件 (TODO)
         if not self.state.third_exec:
-            # TODO: implement human extreme event logic
-            pass
+            # Human extreme event: market breadth < 0.15
+            mb_df = getattr(self.state, 'market_breadth_df', None)
+            if mb_df is not None:
+                mb_row = mb_df.loc[mb_df.index == current_date]
+                if not mb_row.empty:
+                    mb_value = mb_row.iloc[0]['market_breadth']
+                    if mb_value < 0.15:
+                        self.buy_etfs("Human Extreme (Breadth < 0.15)", multiplier=3)
+                        self.state.third_exec = True
 
         # 7. 年度再平衡: 8月第一个交易日
         if current_date.month == 8 and not self.state.rebalanced_this_year_august:

@@ -1,10 +1,9 @@
 import backtrader as bt
-import yfinance as yf
 import os
 import pandas as pd
 import datetime
 import numpy as np
-from hi5 import (
+from hi5.hi5 import (
     Hi5PandasDataWithDividends,
     Hi5Strategy,
     Hi5State,
@@ -13,6 +12,10 @@ from hi5 import (
     BacktestAnalyzer,
 )
 import pytz
+import argparse
+import json
+from google.cloud import bigquery
+from google.oauth2 import service_account
 
 START_DATE = datetime.datetime(2012, 5, 1)
 #END_DATE = datetime.datetime(2023, 12, 31)
@@ -20,76 +23,6 @@ END_DATE = datetime.datetime.now()
 INITIAL_CASH = 100000.0
 COMMISSION_RATE = 0.001
 RISK_FREE_RATE = 0.04
-
-
-def download_multiple_tickers(tickers, start, end, cache_dir="cache"):
-    """Download and cache ticker data with dividends"""
-    if not os.path.exists(cache_dir):
-        os.makedirs(cache_dir)
-    
-    data_dict = {}
-    for ticker in tickers:
-        safe_ticker_name = "".join(c if c.isalnum() else "_" for c in ticker)
-        cache_file = os.path.join(
-            cache_dir,
-            f"{safe_ticker_name}-{start.strftime('%Y-%m-%d')}-{end.strftime('%Y-%m-%d')}.csv",
-        )
-        
-        if os.path.exists(cache_file):
-            # Load cached data
-            df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
-            if "Dividends" not in df.columns:
-                df["Dividends"] = 0.0
-            data_dict[ticker] = df
-        else:
-            # Download new data
-            try:
-                ticker_obj = yf.Ticker(ticker)
-                df_prices = ticker_obj.history(
-                    start=start, end=end, auto_adjust=False, back_adjust=False
-                )
-                if df_prices.empty:
-                    print(f"Warning: No price data for {ticker}")
-                    continue
-                
-                # Handle dividends with timezone conversion
-                us_tz = pytz.timezone("US/Eastern")
-                df_dividends_ts = ticker_obj.dividends.tz_convert(us_tz)
-                start_ts_us = pd.Timestamp(start).tz_localize(us_tz)
-                end_ts_us = pd.Timestamp(end).tz_localize(us_tz)
-                df_dividends = df_dividends_ts[
-                    (df_dividends_ts.index >= start_ts_us)
-                    & (df_dividends_ts.index <= end_ts_us)
-                ]
-                
-                # Initialize dividends column
-                df_prices["Dividends"] = 0.0
-                if not df_dividends.empty:
-                    temp_div_series = pd.Series(df_dividends.values, index=df_dividends.index)
-                    aligned_dividends = temp_div_series.reindex(df_prices.index).fillna(0.0)
-                    df_prices["Dividends"] = aligned_dividends
-
-                # Standardize column names
-                df_prices.rename(
-                    columns={
-                        "Open": "Open",
-                        "High": "High", 
-                        "Low": "Low",
-                        "Close": "Close",
-                        "Volume": "Volume",
-                    },
-                    inplace=True,
-                )
-                
-                # Cache the data
-                df_prices.to_csv(cache_file)
-                data_dict[ticker] = df_prices
-                
-            except Exception as e:
-                print(f"Error downloading {ticker}: {e}")
-                continue
-    
-    return data_dict
 
 
 def setup_cerebro(strategy_tickers):
@@ -127,18 +60,15 @@ def setup_cerebro(strategy_tickers):
 def add_data_feeds(cerebro, tickers_to_download, data_dict):
     """Add data feeds to cerebro"""
     feeds_added = 0
-    
     for ticker_name in tickers_to_download:
         if ticker_name in data_dict and not data_dict[ticker_name].empty:
             df = data_dict[ticker_name]
-            
             # Validate required columns
             required_cols = ["Open", "High", "Low", "Close", "Volume", "Dividends"]
             missing_cols = [col for col in required_cols if col not in df.columns]
             if missing_cols:
                 print(f"Warning: {ticker_name} missing columns: {missing_cols}. Skipping.")
                 continue
-
             # Create and add data feed
             data_feed = Hi5PandasDataWithDividends(
                 dataname=df,
@@ -154,7 +84,6 @@ def add_data_feeds(cerebro, tickers_to_download, data_dict):
             data_feed.plotinfo.plot = False
             cerebro.adddata(data_feed)
             feeds_added += 1
-    
     print(f"Added {feeds_added} data feeds to cerebro")
     return feeds_added
 
@@ -237,7 +166,7 @@ def run_backtest():
     all_tickers = strategy_tickers + benchmark_tickers
     cerebro = setup_cerebro(strategy_tickers)
     print(f"Downloading data for {len(all_tickers)} tickers...")
-    data_dict = download_multiple_tickers(all_tickers, START_DATE, END_DATE)
+    # data_dict = download_multiple_tickers(all_tickers, START_DATE, END_DATE)
     
     if not data_dict:
         print("Error: No data downloaded. Exiting.")
@@ -298,10 +227,100 @@ def try_plot_results(cerebro):
         print(f"Note: Chart plotting failed ({str(e)}), but backtest completed successfully")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Hi5 Backtester with BigQuery support")
+    parser.add_argument('--tickers', type=str, default='VUG,VO,MOAT,PFF,VNQ', help='Comma-separated list of tickers')
+    parser.add_argument('--benchmark-ticker', type=str, default='RSP', help='Benchmark ticker (default: RSP)')
+    parser.add_argument('--start-date', type=str, default='2012-05-01', help='Backtest start date (YYYY-MM-DD)')
+    parser.add_argument('--end-date', type=str, default=None, help='Backtest end date (YYYY-MM-DD, default: today)')
+    parser.add_argument('--gcp-config', type=str, default='hi5/gcp-config.json', help='Path to GCP config JSON')
+    parser.add_argument('--project-id', type=str, required=True, help='GCP project id')
+    return parser.parse_args()
+
+
+def load_bigquery_data(tickers, start_date, end_date, gcp_config, project_id):
+    # Load GCP credentials
+    with open(gcp_config, 'r') as f:
+        gcp_conf = json.load(f)
+    credentials = service_account.Credentials.from_service_account_file(gcp_conf['credentials_path'])
+    client = bigquery.Client(credentials=credentials, project=project_id)
+
+    # Query BigQuery for all tickers and date range
+    tickers_list = ','.join([f"'{t}'" for t in tickers])
+    query = f'''
+        SELECT date, ticker, open, high, low, adjclose as close, volume
+        FROM `hi5-strategy.market_data.marketing`
+        WHERE ticker IN ({tickers_list})
+          AND date >= '{start_date.strftime('%Y-%m-%d')}'
+          AND date <= '{end_date.strftime('%Y-%m-%d')}'
+        ORDER BY ticker, date
+    '''
+    df = client.query(query).to_dataframe()
+    if df.empty:
+        raise RuntimeError('No data returned from BigQuery for the given tickers and date range.')
+
+    # Prepare a dict of DataFrames, one per ticker
+    data_dict = {}
+    for ticker in tickers:
+        tdf = df[df['ticker'] == ticker].copy()
+        tdf = tdf.rename(columns={
+            'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'
+        })
+        tdf['Dividends'] = 0.0  # No dividends data in table
+        tdf = tdf[['date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Dividends']]
+        tdf.set_index('date', inplace=True)
+        data_dict[ticker] = tdf
+    return data_dict
+
+
 if __name__ == "__main__":
-    strategy_instance = run_backtest()
-    
-    #if strategy_instance:
-    #    print("\nBacktest completed successfully!")
-    #else:
-   #     print("\nBacktest failed!")
+    args = parse_args()
+    tickers = [t.strip() for t in args.tickers.split(',')]
+    benchmark_ticker = args.benchmark_ticker
+    start_date = pd.to_datetime(args.start_date)
+    end_date = pd.to_datetime(args.end_date) if args.end_date else datetime.datetime.now()
+    gcp_config = args.gcp_config
+    project_id = args.project_id
+
+    print(f"Tickers: {tickers}")
+    print(f"Benchmark: {benchmark_ticker}")
+    print(f"Start: {start_date}")
+    print(f"End: {end_date}")
+    print(f"GCP Config: {gcp_config}")
+    print(f"Project ID: {project_id}")
+
+    # Step 3/4: Load data from BigQuery and calculate EMA20/market breadth
+    all_tickers = tickers + [benchmark_ticker]
+    data_dict = load_bigquery_data(all_tickers, start_date, end_date, gcp_config, project_id)
+    # market_breadth_df is created in load_bigquery_data (side effect)
+    # For now, recalculate here for clarity
+    for t, df in data_dict.items():
+        df['ema20'] = df['Close'].ewm(span=20, adjust=False).mean()
+        data_dict[t] = df
+    all_dates = sorted(set().union(*[df.index for df in data_dict.values()]))
+    breadth = []
+    for date in all_dates:
+        count = 0
+        total = 0
+        for df in data_dict.values():
+            if date in df.index:
+                total += 1
+                if df.at[date, 'Close'] > df.at[date, 'ema20']:
+                    count += 1
+        frac = count / total if total > 0 else np.nan
+        breadth.append({'date': date, 'market_breadth': frac})
+    market_breadth_df = pd.DataFrame(breadth).set_index('date')
+    print("\nMarket Breadth (first 10 rows):\n", market_breadth_df.head(10))
+
+    # Step 5: Integrate with Backtrader
+    cerebro = setup_cerebro(tickers)
+    feeds_added = add_data_feeds(cerebro, all_tickers, data_dict)
+    if feeds_added == 0:
+        print("Error: No data feeds added. Exiting.")
+        exit(1)
+
+    # Pass market_breadth_df to Hi5State for use in the strategy
+    # (Assume Hi5State can accept an extra attribute for this purpose)
+    cerebro.strats[0][0].kwargs['state'].market_breadth_df = market_breadth_df
+
+    print("Backtrader setup complete. Ready for strategy integration.")

@@ -1,1 +1,0 @@
-python live_trader_offline.py --engine gcp "$@"

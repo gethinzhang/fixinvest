@@ -16,10 +16,12 @@ from email import encoders
 import icalendar
 import sys
 import math
+from google.cloud import bigquery
+from google.oauth2 import service_account
 
 # Import our strategy components
-from hi5 import Hi5State, InMemoryStorageEngine, LocalStorageEngine
-from hi5 import GCPStorageEngine
+from hi5.hi5 import Hi5State, InMemoryStorageEngine, LocalStorageEngine
+from hi5.hi5 import GCPStorageEngine
 
 
 @dataclass
@@ -373,6 +375,8 @@ class OfflineTradingPlanner:
         bucket_name=None,
         blob_name=None,
         credentials_path=None,
+        use_bigquery=False,
+        project_id=None,
     ):
         self.recipient_email = recipient_email
         # test_date can be None, a list of datetimes, or a single datetime
@@ -383,6 +387,16 @@ class OfflineTradingPlanner:
         else:
             self.test_dates = [test_date]
         self.engine = engine
+        self.use_bigquery = use_bigquery
+        self.project_id = project_id
+        
+        # Initialize BigQuery client if needed
+        if use_bigquery:
+            if not credentials_path or not project_id:
+                raise ValueError("credentials_path and project_id are required when use_bigquery is True")
+            credentials = service_account.Credentials.from_service_account_file(credentials_path)
+            self.bq_client = bigquery.Client(credentials=credentials, project=project_id)
+        
         # Email services
         if recipient_email:
             if not all([smtp_server, smtp_port, smtp_username, smtp_password]):
@@ -429,10 +443,61 @@ class OfflineTradingPlanner:
         # Market data cache
         self.price_cache = {}
 
+    def _get_market_data_from_bigquery(self, trading_day: datetime.datetime) -> pd.DataFrame:
+        """Fetch market data from BigQuery for the given trading day"""
+        query = f"""
+        WITH prev_day AS (
+            SELECT 
+                ticker,
+                date,
+                close,
+                LAG(close) OVER (PARTITION BY ticker ORDER BY date) as prev_close
+            FROM `{self.project_id}.market_data.marketing`
+            WHERE date <= DATE('{trading_day.strftime('%Y-%m-%d')}')
+        )
+        SELECT 
+            ticker,
+            date,
+            close,
+            prev_close,
+            (close - prev_close) as change,
+            ((close - prev_close) / prev_close * 100) as change_percent
+        FROM prev_day
+        WHERE date = DATE('{trading_day.strftime('%Y-%m-%d')}')
+        AND ticker IN UNNEST(@tickers)
+        """
+        
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ArrayQueryParameter("tickers", "STRING", self.tickers + [self.benchmark_ticker])
+            ]
+        )
+        
+        query_job = self.bq_client.query(query, job_config=job_config)
+        results = query_job.result()
+        
+        # Convert to DataFrame and ensure correct types
+        df = results.to_dataframe()
+        if df.empty:
+            raise RuntimeError(f"No data found in BigQuery for {trading_day.strftime('%Y-%m-%d')}")
+        
+        # Create a new DataFrame with only essential columns and proper types
+        clean_df = pd.DataFrame({
+            'ticker': df['ticker'].astype(str),
+            'date': pd.to_datetime(df['date']).dt.date,
+            'close': df['close'].astype(float),
+            'prev_close': df['prev_close'].astype(float),
+            'change': df['change'].astype(float),
+            'change_percent': df['change_percent'].astype(float)
+        })
+            
+        return clean_df
+
     def update_market_data(self, trading_day, preloaded_data=None):
         """
         Fetch market data for the previous trading day.
         If preloaded_data is provided (multi-ticker DataFrame), use it.
+        If use_bigquery is True, fetch from BigQuery instead of yfinance.
         """
         all_tickers = self.tickers + [self.benchmark_ticker]
         self.price_cache = {}
@@ -481,6 +546,24 @@ class OfflineTradingPlanner:
                 except Exception as e:
                     print(f"Error fetching data for {ticker}: {e}")
                     raise
+        elif self.use_bigquery:
+            print(f"Fetching data from BigQuery for {trading_day.strftime('%Y-%m-%d')}")
+            try:
+                df = self._get_market_data_from_bigquery(trading_day)
+                for _, row in df.iterrows():
+                    ticker = row['ticker']
+                    self.price_cache[ticker] = {
+                        "current": row['close'],
+                        "previous_close": row['prev_close'],
+                        "change": row['change'],
+                        "change_percent": row['change_percent'],
+                    }
+                    print(
+                        f"{ticker}: ${row['close']:.2f} (Prev: ${row['prev_close']:.2f}, {row['change_percent']:+.2f}%)"
+                    )
+            except Exception as e:
+                print(f"Error fetching data from BigQuery: {e}")
+                raise
         else:
             # Single-date or continuous mode: download just for this ticker
             prev_trading_day = trading_day - datetime.timedelta(days=1)
@@ -497,7 +580,14 @@ class OfflineTradingPlanner:
                         progress=False,
                         auto_adjust=True,
                     )
-                    closes = df["Close"].loc[: prev_trading_day.strftime("%Y-%m-%d")]
+                    # Create a clean DataFrame with only essential columns and proper types
+                    clean_df = pd.DataFrame({
+                        'date': pd.to_datetime(df.index).date,
+                        'close': df['Close'].astype(float),
+                        'volume': df['Volume'].round(0).astype(pd.Int64Dtype())
+                    })
+                    
+                    closes = clean_df['close'].loc[: prev_trading_day.strftime("%Y-%m-%d")]
                     if len(closes) < 1:
                         raise RuntimeError(
                             f"No data for {ticker} on {prev_trading_day.strftime('%Y-%m-%d')}"
@@ -883,6 +973,15 @@ def main():
         help="Path to GCP config file (default: gcp_config.json)",
         default="gcp-config.json",
     )
+    parser.add_argument(
+        "--use-bigquery",
+        action="store_true",
+        help="Use BigQuery instead of yfinance for market data",
+    )
+    parser.add_argument(
+        "--project-id",
+        help="GCP project ID (required when using BigQuery)",
+    )
 
     args = parser.parse_args()
 
@@ -916,19 +1015,18 @@ def main():
             )
             return
 
-    if args.engine == "gcp":
-        # check gcp_config file exists
-        with open(args.gcp_config, "r") as f:
-            gcp_config = json.load(f)
-        if not gcp_config:
-            print(f"Error: GCP config file {args.gcp_config} is empty.")
-            return
-        if (
-            not gcp_config.get("bucket_name")
-            or not gcp_config.get("blob_name")
-        ):
-            print(f"Error: GCP config file {args.gcp_config} is missing required fields.")
-            return
+    # check gcp_config file exists
+    with open(args.gcp_config, "r") as f:
+        gcp_config = json.load(f)
+    if not gcp_config:
+        print(f"Error: GCP config file {args.gcp_config} is empty.")
+        return
+    if (
+        not gcp_config.get("bucket_name")
+        or not gcp_config.get("blob_name")
+    ):
+        print(f"Error: GCP config file {args.gcp_config} is missing required fields.")
+        return
 
     # Configuration
     config = {
@@ -941,7 +1039,9 @@ def main():
         "engine": args.engine,
         "bucket_name": gcp_config.get("bucket_name") if args.engine == "gcp" else None,
         "blob_name": gcp_config.get("blob_name") if args.engine == "gcp" else None,
-        "credentials_path": gcp_config.get("credentials_path") if args.engine == "gcp" else None,
+        "credentials_path": gcp_config.get("credentials_path"),
+        "use_bigquery": args.use_bigquery,
+        "project_id": args.project_id,
     }
 
     # Create planner
@@ -955,27 +1055,35 @@ def main():
         f"Batch downloading all ticker data from {download_start.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
     )
     all_tickers = planner.tickers + [planner.benchmark_ticker]
-    data = yf.download(
-        all_tickers,
-        start=download_start.strftime("%Y-%m-%d"),
-        end=(end_date + datetime.timedelta(days=1)).strftime("%Y-%m-%d"),
-        group_by="ticker",
-        progress=False,
-        auto_adjust=False,
-    )
-    if len(all_tickers) == 1:
-        data = {all_tickers[0]: data}
-    available_dates = data.index
+    
+    if not args.use_bigquery:
+        data = yf.download(
+            all_tickers,
+            start=download_start.strftime("%Y-%m-%d"),
+            end=(end_date + datetime.timedelta(days=1)).strftime("%Y-%m-%d"),
+            group_by="ticker",
+            progress=False,
+            auto_adjust=False,
+        )
+        if len(all_tickers) == 1:
+            data = {all_tickers[0]: data}
+        available_dates = data.index
+    else:
+        data = None
+        available_dates = None
 
     for d in test_dates:
         d_ts = pd.Timestamp(d)
-        prev_trading_days = available_dates[available_dates < d_ts]
-        if len(prev_trading_days) == 0:
-            print(
-                f"Skipping {d.strftime('%Y-%m-%d')}: no previous trading day available."
-            )
-            continue
-        prev_trading_day = prev_trading_days[-1]
+        if not args.use_bigquery:
+            prev_trading_days = available_dates[available_dates < d_ts]
+            if len(prev_trading_days) == 0:
+                print(
+                    f"Skipping {d.strftime('%Y-%m-%d')}: no previous trading day available."
+                )
+                continue
+            prev_trading_day = prev_trading_days[-1]
+        else:
+            prev_trading_day = d
         planner.run_planning_cycle(
             decision_day=d, market_data_day=prev_trading_day, preloaded_data=data
         )
