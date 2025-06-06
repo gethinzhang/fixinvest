@@ -3,4 +3,5 @@ numpy>=1.24.0
 yfinance>=0.2.36
 google-cloud-bigquery>=3.11.0
 google-auth>=2.22.0
-pyarrow>=14.0.1 
+pyarrow>=16.0.0
+pandas-gbq>=0.26.1

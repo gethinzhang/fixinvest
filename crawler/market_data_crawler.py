@@ -13,6 +13,7 @@ import json
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+import pytz
 
 # Set up logging
 logging.basicConfig(
@@ -24,6 +25,9 @@ logger = logging.getLogger(__name__)
 class MarketDataCrawler:
     def __init__(self, gcp_config_path: str, smtp_config_path: str):
         """Initialize the MarketDataCrawler with BigQuery credentials."""
+        # Set timezone
+        self.timezone = pytz.timezone('America/New_York')
+        
         # Load GCP configuration
         with open(gcp_config_path, 'r') as f:
             gcp_config = json.load(f)
@@ -63,6 +67,7 @@ class MarketDataCrawler:
             volume INT64,
             capital_gains FLOAT64,
             split_ratio FLOAT64,
+            update_time TIMESTAMP,
             PRIMARY KEY(date, ticker) NOT ENFORCED
         )
         """
@@ -82,6 +87,7 @@ class MarketDataCrawler:
             ema20 FLOAT64,
             ema50 FLOAT64,
             ema200 FLOAT64,
+            update_time TIMESTAMP,
             PRIMARY KEY(date, ticker) NOT ENFORCED
         )
         """
@@ -110,6 +116,7 @@ class MarketDataCrawler:
             ema20_ratio FLOAT64,
             ema50_ratio FLOAT64,
             ema200_ratio FLOAT64,
+            update_time TIMESTAMP,
             PRIMARY KEY(date) NOT ENFORCED
         )
         """
@@ -174,6 +181,11 @@ class MarketDataCrawler:
 
     def update_market_breadth(self, start_date: Optional[datetime.datetime] = None, end_date: Optional[datetime.datetime] = None):
         """Directly calculate and update market breadth metrics in BigQuery for the given date range."""
+        if end_date is None:
+            end_date = datetime.datetime.now(self.timezone)
+        else:
+            end_date = self.timezone.localize(end_date.replace(tzinfo=None))
+        
         if start_date is None:
             # Get the last date in the market breadth table
             query = f"""
@@ -183,74 +195,44 @@ class MarketDataCrawler:
             result = self.client.query(query).result()
             last_date = next(result).last_date
             if last_date is None:
-                start_date = datetime.datetime.now() - datetime.timedelta(days=90)
+                start_date = end_date - datetime.timedelta(days=90)
             else:
                 start_date = last_date + datetime.timedelta(days=1)
-        if end_date is None:
-            end_date = datetime.datetime.now()
+        else:
+            start_date = self.timezone.localize(start_date.replace(tzinfo=None))
 
         print(f"update market breadth start_date: {start_date}, end_date: {end_date}")
 
         merge_sql = f"""
-        MERGE `{self.project_id}.{self.dataset_id}.{self.market_breadth_table}` target
-        USING (
-            SELECT
-                m.date,
-                COUNTIF(adj_close > ma20) as ma20_above,
-                COUNTIF(adj_close <= ma20) as ma20_below,
-                COUNTIF(adj_close > ma50) as ma50_above,
-                COUNTIF(adj_close <= ma50) as ma50_below,
-                COUNTIF(adj_close > ma200) as ma200_above,
-                COUNTIF(adj_close <= ma200) as ma200_below,
-                SAFE_DIVIDE(COUNTIF(adj_close > ma20), COUNT(*)) as ma20_ratio,
-                SAFE_DIVIDE(COUNTIF(adj_close > ma50), COUNT(*)) as ma50_ratio,
-                SAFE_DIVIDE(COUNTIF(adj_close > ma200), COUNT(*)) as ma200_ratio,
-                COUNTIF(adj_close > ema20) as ema20_above,
-                COUNTIF(adj_close <= ema20) as ema20_below,
-                COUNTIF(adj_close > ema50) as ema50_above,
-                COUNTIF(adj_close <= ema50) as ema50_below,
-                COUNTIF(adj_close > ema200) as ema200_above,
-                COUNTIF(adj_close <= ema200) as ema200_below,
-                SAFE_DIVIDE(COUNTIF(adj_close > ema20), COUNT(*)) as ema20_ratio,
-                SAFE_DIVIDE(COUNTIF(adj_close > ema50), COUNT(*)) as ema50_ratio,
-                SAFE_DIVIDE(COUNTIF(adj_close > ema200), COUNT(*)) as ema200_ratio
-            FROM `{self.project_id}.{self.dataset_id}.marketing` m
-            JOIN `{self.project_id}.{self.dataset_id}.technical_indicators` t
-                ON m.date = t.date AND m.ticker = t.ticker
-            WHERE m.date >= '{start_date.strftime('%Y-%m-%d')}'
-              AND m.date <= '{end_date.strftime('%Y-%m-%d')}'
-              AND m.ticker IN (SELECT ticker from `{self.project_id}.{self.dataset_id}.crawler_tickers` WHERE is_sp500=TRUE)
-            GROUP BY date
-        ) source
-        ON target.date = source.date
-        WHEN MATCHED THEN
-            UPDATE SET
-                ma20_above = source.ma20_above,
-                ma20_below = source.ma20_below,
-                ma50_above = source.ma50_above,
-                ma50_below = source.ma50_below,
-                ma200_above = source.ma200_above,
-                ma200_below = source.ma200_below,
-                ma20_ratio = source.ma20_ratio,
-                ma50_ratio = source.ma50_ratio,
-                ma200_ratio = source.ma200_ratio,
-                ema20_above = source.ema20_above,
-                ema20_below = source.ema20_below,
-                ema50_above = source.ema50_above,
-                ema50_below = source.ema50_below,
-                ema200_above = source.ema200_above,
-                ema200_below = source.ema200_below,
-                ema20_ratio = source.ema20_ratio,
-                ema50_ratio = source.ema50_ratio,
-                ema200_ratio = source.ema200_ratio
-        WHEN NOT MATCHED THEN
-            INSERT (date, ma20_above, ma20_below, ma50_above, ma50_below, ma200_above, ma200_below,
-                    ma20_ratio, ma50_ratio, ma200_ratio, ema20_above, ema20_below, ema50_above, ema50_below,
-                    ema200_above, ema200_below, ema20_ratio, ema50_ratio, ema200_ratio)
-            VALUES (source.date, source.ma20_above, source.ma20_below, source.ma50_above, source.ma50_below,
-                    source.ma200_above, source.ma200_below, source.ma20_ratio, source.ma50_ratio, source.ma200_ratio,
-                    source.ema20_above, source.ema20_below, source.ema50_above, source.ema50_below,
-                    source.ema200_above, source.ema200_below, source.ema20_ratio, source.ema50_ratio, source.ema200_ratio)
+       SELECT
+    m.date,
+    COUNTIF(adj_close > ma20) as ma20_above,
+    COUNTIF(adj_close <= ma20) as ma20_below,
+    COUNTIF(adj_close > ma50) as ma50_above,
+    COUNTIF(adj_close <= ma50) as ma50_below,
+    COUNTIF(adj_close > ma200) as ma200_above,
+    COUNTIF(adj_close <= ma200) as ma200_below,
+    SAFE_DIVIDE(COUNTIF(adj_close > ma20), COUNT(*)) as ma20_ratio,
+    SAFE_DIVIDE(COUNTIF(adj_close > ma50), COUNT(*)) as ma50_ratio,
+    SAFE_DIVIDE(COUNTIF(adj_close > ma200), COUNT(*)) as ma200_ratio,
+    COUNTIF(adj_close > ema20) as ema20_above,
+    COUNTIF(adj_close <= ema20) as ema20_below,
+    COUNTIF(adj_close > ema50) as ema50_above,
+    COUNTIF(adj_close <= ema50) as ema50_below,
+    COUNTIF(adj_close > ema200) as ema200_above,
+    COUNTIF(adj_close <= ema200) as ema200_below,
+    SAFE_DIVIDE(COUNTIF(adj_close > ema20), COUNT(*)) as ema20_ratio,
+    SAFE_DIVIDE(COUNTIF(adj_close > ema50), COUNT(*)) as ema50_ratio,
+    SAFE_DIVIDE(COUNTIF(adj_close > ema200), COUNT(*)) as ema200_ratio,
+    CURRENT_TIMESTAMP() as update_time
+FROM `{self.project_id}.{self.dataset_id}.marketing` m
+JOIN `{self.project_id}.{self.dataset_id}.technical_indicators` t
+    ON m.date = t.date AND m.ticker = t.ticker
+WHERE m.date >= '{start_date.strftime('%Y-%m-%d')}'
+    AND m.date <= '{end_date.strftime('%Y-%m-%d')}'
+    AND m.ticker IN (SELECT ticker from `{self.project_id}.{self.dataset_id}.crawler_tickers` WHERE is_sp500=TRUE)
+GROUP BY date
+ORDER BY date;
         """
         
         self.client.query(merge_sql).result()
@@ -271,6 +253,11 @@ class MarketDataCrawler:
         logger.info(f"Processing {len(symbols)} symbols")
 
         # Determine date range
+        if end_date is None:
+            end_date = datetime.datetime.now(self.timezone)
+        else:
+            end_date = self.timezone.localize(end_date.replace(tzinfo=None))
+        
         if start_date is None:
             # Get the last date in the marketing table
             query = f"""
@@ -282,12 +269,11 @@ class MarketDataCrawler:
 
             if last_date is None:
                 # If no data exists, start from 90 days ago
-                start_date = datetime.datetime.now() - datetime.timedelta(days=90)
+                start_date = end_date - datetime.timedelta(days=90)
             else:
                 start_date = last_date + datetime.timedelta(days=1)
-
-        if end_date is None:
-            end_date = datetime.datetime.now()
+        else:
+            start_date = self.timezone.localize(start_date.replace(tzinfo=None))
 
         logger.info(f"Updating data from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
 
@@ -327,6 +313,9 @@ class MarketDataCrawler:
             symbol_data = symbol_data.rename(columns={'Capital Gains': 'capital_gains'})
             symbol_data['Volume'] = symbol_data['Volume'].fillna(0).round(0).astype(pd.Int64Dtype())
 
+            # Add update_time
+            symbol_data['update_time'] = datetime.datetime.now(self.timezone)
+
             # Upload to BigQuery
             table_ref = f"{self.project_id}.{self.dataset_id}.marketing"
             job_config = bigquery.LoadJobConfig(
@@ -353,7 +342,7 @@ class MarketDataCrawler:
             FROM (
                 SELECT
                     *,
-                    ROW_NUMBER() OVER(PARTITION BY `date` ORDER BY `date` DESC) as row_num
+                    ROW_NUMBER() OVER(PARTITION BY `date` ORDER BY `update_time` DESC) as row_num
                 FROM `{self.project_id}.{self.dataset_id}.{self.market_breadth_table}`
             )
             WHERE row_num = 1
@@ -369,7 +358,7 @@ class MarketDataCrawler:
             FROM (
                 SELECT
                     *,
-                    ROW_NUMBER() OVER(PARTITION BY `date`, `ticker` ORDER BY `date` DESC) as row_num
+                    ROW_NUMBER() OVER(PARTITION BY `date`, `ticker` ORDER BY `update_time` DESC) as row_num
                 FROM `{self.project_id}.{self.dataset_id}.marketing`
             )
             WHERE row_num = 1
@@ -385,7 +374,7 @@ class MarketDataCrawler:
             FROM (
                 SELECT
                     *,
-                    ROW_NUMBER() OVER(PARTITION BY `date`, `ticker` ORDER BY `date` DESC) as row_num
+                    ROW_NUMBER() OVER(PARTITION BY `date`, `ticker` ORDER BY `update_time` DESC) as row_num
                 FROM `{self.project_id}.{self.dataset_id}.technical_indicators`
             )
             WHERE row_num = 1
@@ -443,9 +432,14 @@ Timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         """Calculate and update technical indicators using BigQuery SQL.
         
         Args:
-            start_date: Optional start date for calculation
-            end_date: Optional end date for calculation
+            start_date: Optional start date for calculation. The function will look back 200 days from this date.
+            end_date: Optional end date for calculation. The function will look back 200 days from this date.
         """
+        if end_date is None:
+            end_date = datetime.datetime.now(self.timezone)
+        else:
+            end_date = self.timezone.localize(end_date.replace(tzinfo=None))
+        
         if start_date is None:
             # Get the last date in the technical indicators table
             query = f"""
@@ -457,114 +451,111 @@ Timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
             if last_date is None:
                 # If no data exists, start from 200 days ago to ensure enough data for MA200
-                start_date = datetime.datetime.now() - datetime.timedelta(days=200)
+                start_date = end_date - datetime.timedelta(days=200)
             else:
                 start_date = last_date + datetime.timedelta(days=1)
+        else:
+            start_date = self.timezone.localize(start_date.replace(tzinfo=None))
 
-        if end_date is None:
-            end_date = datetime.datetime.now()
-
+        # Calculate the lookback start date (200 days before the start_date)
+        lookback_start = start_date - datetime.timedelta(days=400)
+        
         logger.info(f"Updating technical indicators from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
 
         # Calculate technical indicators using window functions
         merge_query = f"""
-        MERGE `{self.project_id}.{self.dataset_id}.technical_indicators` target
-        USING (
-            SELECT
-                date,
-                ticker,
-                ma5,
-                ma20,
-                ma50,
-                ma200,
-                ema5,
-                ema20,
-                ema50,
-                ema200
-            FROM (
-                SELECT
-                    pd.date,
-                    pd.ticker,
-                    pd.adj_close,
-                    pd.ma5,
-                    pd.ma20,
-                    pd.ma50,
-                    pd.ma200,
-                    pd.ma5 as ema5, 
-                    pd.ma20 as ema20,
-                    pd.ma50 as ema50,
-                    pd.ma200 as ema200
-                FROM (
-                    SELECT
-                        date,
-                        ticker,
-                        adj_close,
-                        CASE
-                            WHEN COUNT(adj_close) OVER (
-                                PARTITION BY ticker
-                                ORDER BY date
-                                ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
-                            ) = 5 THEN AVG(adj_close) OVER (
-                                PARTITION BY ticker
-                                ORDER BY date
-                                ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
-                            )
-                        END as ma5,
-                        CASE
-                            WHEN COUNT(adj_close) OVER (
-                                PARTITION BY ticker
-                                ORDER BY date
-                                ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
-                            ) = 20 THEN AVG(adj_close) OVER (
-                                PARTITION BY ticker
-                                ORDER BY date
-                                ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
-                            )
-                        END as ma20,
-                        CASE
-                            WHEN COUNT(adj_close) OVER (
-                                PARTITION BY ticker
-                                ORDER BY date
-                                ROWS BETWEEN 49 PRECEDING AND CURRENT ROW
-                            ) = 50 THEN AVG(adj_close) OVER (
-                                PARTITION BY ticker
-                                ORDER BY date
-                                ROWS BETWEEN 49 PRECEDING AND CURRENT ROW
-                            )
-                        END as ma50,
-                        CASE
-                            WHEN COUNT(adj_close) OVER (
-                                PARTITION BY ticker
-                                ORDER BY date
-                                ROWS BETWEEN 199 PRECEDING AND CURRENT ROW
-                            ) = 200 THEN AVG(adj_close) OVER (
-                                PARTITION BY ticker
-                                ORDER BY date
-                                ROWS BETWEEN 199 PRECEDING AND CURRENT ROW
-                            )
-                        END as ma200
-                        FROM `{self.project_id}.{self.dataset_id}.marketing`
-                        WHERE date >= '{start_date.strftime('%Y-%m-%d')}'
-                          AND date <= '{end_date.strftime('%Y-%m-%d')}'
-                ) pd
-            ) ec
-        ) source
-        ON target.date = source.date AND target.ticker = source.ticker
-        WHEN MATCHED THEN
-            UPDATE SET
-                ma5 = source.ma5,
-                ma20 = source.ma20,
-                ma50 = source.ma50,
-                ma200 = source.ma200,
-                ema5 = source.ema5,
-                ema20 = source.ema20,
-                ema50 = source.ema50,
-                ema200 = source.ema200
-        WHEN NOT MATCHED THEN
-            INSERT (date, ticker, ma5, ma20, ma50, ma200, ema5, ema20, ema50, ema200)
-            VALUES (source.date, source.ticker, source.ma5, source.ma20, source.ma50, source.ma200, 
-                    source.ema5, source.ema20, source.ema50, source.ema200)
+        INSERT INTO `{self.project_id}.{self.dataset_id}.technical_indicators` (
+    date,
+    ticker,
+    ma5,
+    ma20,
+    ma50,
+    ma200,
+    ema5,
+    ema20,
+    ema50,
+    ema200,
+    update_time
+)
+WITH price_data AS (
+    -- 1. Select the base data with a look-back period to ensure EMA stability
+    SELECT
+        date,
+        ticker,
+        adj_close
+    FROM
+        `{self.project_id}.{self.dataset_id}.marketing`
+    WHERE
+        date >= '{lookback_start.strftime('%Y-%m-%d')}'
+        AND date <= '{end_date.strftime('%Y-%m-%d')}'
+),
+smas_and_previous_close AS (
+    -- 2. Calculate SMAs and get the previous day's close for the EMA calculation
+    SELECT
+        date,
+        ticker,
+        adj_close,
+        -- Simple Moving Averages
+        AVG(adj_close) OVER (PARTITION BY ticker ORDER BY date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS ma5,
+        AVG(adj_close) OVER (PARTITION BY ticker ORDER BY date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS ma20,
+        AVG(adj_close) OVER (PARTITION BY ticker ORDER BY date ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS ma50,
+        AVG(adj_close) OVER (PARTITION BY ticker ORDER BY date ROWS BETWEEN 199 PRECEDING AND CURRENT ROW) AS ma200,
+        -- Get previous day's adjusted close. This will be NULL for the first row in each partition.
+        LAG(adj_close, 1) OVER (PARTITION BY ticker ORDER BY date) as prev_adj_close
+    FROM price_data
+),
+ema_calcs AS (
+    -- 3. Calculate Exponential Moving Averages using the corrected LAG/COALESCE pattern
+    SELECT
+        date,
+        ticker,
+        ma5,
+        ma20,
+        ma50,
+        ma200,
+        -- The COALESCE function handles the first day of data for each ticker, using the current adj_close as the starting "previous" EMA.
+        -- EMA 5
+        (
+            adj_close * (2.0 / (5 + 1)) +
+            COALESCE(prev_adj_close, adj_close) * (1 - (2.0 / (5 + 1)))
+        ) AS ema5,
+        -- EMA 20
+        (
+            adj_close * (2.0 / (20 + 1)) +
+            COALESCE(prev_adj_close, adj_close) * (1 - (2.0 / (20 + 1)))
+        ) AS ema20,
+        -- EMA 50
+        (
+            adj_close * (2.0 / (50 + 1)) +
+            COALESCE(prev_adj_close, adj_close) * (1 - (2.0 / (50 + 1)))
+        ) AS ema50,
+        -- EMA 200
+        (
+            adj_close * (2.0 / (200 + 1)) +
+            COALESCE(prev_adj_close, adj_close) * (1 - (2.0 / (200 + 1)))
+        ) AS ema200,
+        CURRENT_TIMESTAMP() as update_time
+    FROM smas_and_previous_close
+)
+-- 4. Select the final data to be inserted, filtering out the initial look-back period
+SELECT
+    date,
+    ticker,
+    ma5,
+    ma20,
+    ma50,
+    ma200,
+    ema5,
+    ema20,
+    ema50,
+    ema200,
+    update_time
+FROM
+    ema_calcs
+WHERE
+    date >= '{lookback_start.strftime('%Y-%m-%d')}'
         """
+        
         self.client.query(merge_query).result()
         logger.info("Technical indicators update completed successfully")
 
@@ -602,7 +593,7 @@ def main():
     )
     parser.add_argument(
         "--crawl",
-        default="market,breadth,dedup",
+        default="market,indicators,breadth,dedup",
         help="Comma-separated list of operations to perform. Options: market (crawl market data), indicators (calculate technical indicators), breadth (calculate market breadth), dedup (deduplicate tables). Default: market,breadth,dedup"
     )
 
@@ -614,14 +605,18 @@ def main():
     
     if args.start_date:
         try:
+            # Parse the date and localize it to New York timezone
             start_date = datetime.datetime.strptime(args.start_date, "%Y-%m-%d")
+            start_date = pytz.timezone('America/New_York').localize(start_date)
         except ValueError:
             logger.error("Invalid start date format. Use YYYY-MM-DD")
             sys.exit(1)
     
     if args.end_date:
         try:
+            # Parse the date and localize it to New York timezone
             end_date = datetime.datetime.strptime(args.end_date, "%Y-%m-%d")
+            end_date = pytz.timezone('America/New_York').localize(end_date)
         except ValueError:
             logger.error("Invalid end date format. Use YYYY-MM-DD")
             sys.exit(1)
@@ -650,19 +645,15 @@ def main():
         # Execute requested operations
         if 'market' in categories:
             crawler.update_market_data(start_date, end_date, specific_tickers)
-            logger.info("Market data update completed successfully")
 
         if 'indicators' in categories:
             crawler.update_technical_indicators(start_date, end_date)
-            logger.info("Technical indicators update completed successfully")
 
         if 'breadth' in categories:
             crawler.update_market_breadth(start_date, end_date)
-            logger.info("Market breadth update completed successfully")
 
         if 'dedup' in categories:
             crawler.deduplicate_tables(categories)
-            logger.info("Deduplication completed successfully")
 
         # Send success notification
         crawler.send_crawler_notification(categories, args.email, success=True)

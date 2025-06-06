@@ -5,7 +5,6 @@ import json
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 import pandas as pd
-import numpy as np
 import yfinance as yf
 import pytz
 import smtplib
@@ -15,7 +14,6 @@ from email.mime.base import MIMEBase
 from email import encoders
 import icalendar
 import sys
-import math
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
@@ -375,7 +373,6 @@ class OfflineTradingPlanner:
         bucket_name=None,
         blob_name=None,
         credentials_path=None,
-        use_bigquery=False,
         project_id=None,
     ):
         self.recipient_email = recipient_email
@@ -387,15 +384,13 @@ class OfflineTradingPlanner:
         else:
             self.test_dates = [test_date]
         self.engine = engine
-        self.use_bigquery = use_bigquery
         self.project_id = project_id
         
-        # Initialize BigQuery client if needed
-        if use_bigquery:
-            if not credentials_path or not project_id:
-                raise ValueError("credentials_path and project_id are required when use_bigquery is True")
-            credentials = service_account.Credentials.from_service_account_file(credentials_path)
-            self.bq_client = bigquery.Client(credentials=credentials, project=project_id)
+        # Initialize BigQuery client
+        if not credentials_path or not project_id:
+            raise ValueError("credentials_path and project_id are required")
+        credentials = service_account.Credentials.from_service_account_file(credentials_path)
+        self.bq_client = bigquery.Client(credentials=credentials, project=project_id)
         
         # Email services
         if recipient_email:
@@ -432,9 +427,6 @@ class OfflineTradingPlanner:
         else:
             raise ValueError(f"Unknown engine: {engine}")
         self.state = Hi5State(storage_engine=storage_engine)
-        # Add month_start_date to state if not present
-        if not hasattr(self.state, 'month_start_date'):
-            self.state.month_start_date = None
         # Trading parameters (from Hi5Strategy)
         self.tickers = ["VUG", "VO", "MOAT", "PFF", "VNQ"]
         self.benchmark_ticker = "RSP"
@@ -495,123 +487,65 @@ class OfflineTradingPlanner:
 
     def update_market_data(self, trading_day, preloaded_data=None):
         """
-        Fetch market data for the previous trading day.
-        If preloaded_data is provided (multi-ticker DataFrame), use it.
-        If use_bigquery is True, fetch from BigQuery instead of yfinance.
+        Fetch market data from BigQuery for the previous trading day.
         """
         all_tickers = self.tickers + [self.benchmark_ticker]
         self.price_cache = {}
 
-        if preloaded_data is not None:
-            print(f"Using preloaded data for {trading_day.strftime('%Y-%m-%d')}")
-            # The DataFrame has columns like ('VUG', 'Close'), ('VO', 'Close'), etc.
-            df = preloaded_data
-            # Get all available dates
-            available_dates = df.index
-            if pd.Timestamp(trading_day) not in available_dates:
-                raise RuntimeError(
-                    f"No data for trading day {trading_day.strftime('%Y-%m-%d')}"
+        print(f"Fetching data from BigQuery for {trading_day.strftime('%Y-%m-%d')}")
+        try:
+            # Get current day data
+            current_query = f"""
+            WITH prev_day AS (
+                SELECT 
+                    ticker,
+                    date,
+                    adj_close,
+                    LAG(adj_close) OVER (PARTITION BY ticker ORDER BY date) as prev_adj_close
+                FROM `{self.project_id}.market_data.marketing`
+                WHERE date <= DATE('{trading_day.strftime('%Y-%m-%d')}')
+            )
+            SELECT 
+                ticker,
+                date,
+                adj_close as close,
+                prev_adj_close as prev_close,
+                (adj_close - prev_adj_close) as change,
+                ((adj_close - prev_adj_close) / prev_adj_close * 100) as change_percent
+            FROM prev_day
+            WHERE date = DATE('{trading_day.strftime('%Y-%m-%d')}')
+            AND ticker IN UNNEST(@tickers)
+            """
+            
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ArrayQueryParameter("tickers", "STRING", all_tickers)
+                ]
+            )
+            
+            query_job = self.bq_client.query(current_query, job_config=job_config)
+            results = query_job.result()
+            
+            # Convert to DataFrame and ensure correct types
+            df = results.to_dataframe()
+            if df.empty:
+                raise RuntimeError(f"No data found in BigQuery for {trading_day.strftime('%Y-%m-%d')}")
+            
+            for _, row in df.iterrows():
+                ticker = row['ticker']
+                self.price_cache[ticker] = {
+                    "current": row['close'],
+                    "previous_close": row['prev_close'],
+                    "change": row['change'],
+                    "change_percent": row['change_percent'],
+                }
+                print(
+                    f"{ticker}: ${row['close']:.2f} (Prev: ${row['prev_close']:.2f}, {row['change_percent']:+.2f}%)"
                 )
-            prev_idx = available_dates.get_loc(pd.Timestamp(trading_day)) - 1
-            if prev_idx < 0:
-                raise RuntimeError(
-                    f"No previous trading day for {trading_day.strftime('%Y-%m-%d')}"
-                )
-            prev_trading_day = available_dates[prev_idx]
-            prev_prev_idx = prev_idx - 1 if prev_idx - 1 >= 0 else None
-            for ticker in all_tickers:
-                try:
-                    closes = df[(ticker, "Close")]
-                    close_price = closes.loc[prev_trading_day]
-                    prev_close = (
-                        closes.iloc[prev_prev_idx]
-                        if prev_prev_idx is not None
-                        else close_price
-                    )
-                    change = close_price - prev_close
-                    change_percent = (
-                        (change / prev_close * 100)
-                        if pd.notna(prev_close) and prev_close != 0
-                        else 0
-                    )
-                    self.price_cache[ticker] = {
-                        "current": close_price,
-                        "previous_close": prev_close,
-                        "change": change,
-                        "change_percent": change_percent,
-                    }
-                    print(
-                        f"{ticker}: ${close_price:.2f} (Prev: ${prev_close:.2f}, {change_percent:+.2f}%)"
-                    )
-                except Exception as e:
-                    print(f"Error fetching data for {ticker}: {e}")
-                    raise
-        elif self.use_bigquery:
-            print(f"Fetching data from BigQuery for {trading_day.strftime('%Y-%m-%d')}")
-            try:
-                df = self._get_market_data_from_bigquery(trading_day)
-                for _, row in df.iterrows():
-                    ticker = row['ticker']
-                    self.price_cache[ticker] = {
-                        "current": row['close'],
-                        "previous_close": row['prev_close'],
-                        "change": row['change'],
-                        "change_percent": row['change_percent'],
-                    }
-                    print(
-                        f"{ticker}: ${row['close']:.2f} (Prev: ${row['prev_close']:.2f}, {row['change_percent']:+.2f}%)"
-                    )
-            except Exception as e:
-                print(f"Error fetching data from BigQuery: {e}")
-                raise
-        else:
-            # Single-date or continuous mode: download just for this ticker
-            prev_trading_day = trading_day - datetime.timedelta(days=1)
-            for ticker in all_tickers:
-                try:
-                    df = yf.download(
-                        ticker,
-                        start=(prev_trading_day - datetime.timedelta(days=7)).strftime(
-                            "%Y-%m-%d"
-                        ),
-                        end=(trading_day + datetime.timedelta(days=1)).strftime(
-                            "%Y-%m-%d"
-                        ),
-                        progress=False,
-                        auto_adjust=True,
-                    )
-                    # Create a clean DataFrame with only essential columns and proper types
-                    clean_df = pd.DataFrame({
-                        'date': pd.to_datetime(df.index).date,
-                        'close': df['Close'].astype(float),
-                        'volume': df['Volume'].round(0).astype(pd.Int64Dtype())
-                    })
-                    
-                    closes = clean_df['close'].loc[: prev_trading_day.strftime("%Y-%m-%d")]
-                    if len(closes) < 1:
-                        raise RuntimeError(
-                            f"No data for {ticker} on {prev_trading_day.strftime('%Y-%m-%d')}"
-                        )
-                    close_price = closes.iloc[-1]
-                    prev_close = closes.iloc[-2] if len(closes) >= 2 else close_price
-                    change = close_price - prev_close
-                    change_percent = (
-                        (change / prev_close * 100)
-                        if pd.notna(prev_close) and prev_close != 0
-                        else 0
-                    )
-                    self.price_cache[ticker] = {
-                        "current": close_price,
-                        "previous_close": prev_close,
-                        "change": change,
-                        "change_percent": change_percent,
-                    }
-                    print(
-                        f"{ticker}: ${close_price:.2f} (Prev: ${prev_close:.2f}, {change_percent:+.2f}%)"
-                    )
-                except Exception as e:
-                    print(f"Error fetching data for {ticker}: {e}")
-                    raise
+
+        except Exception as e:
+            print(f"Error fetching data from BigQuery: {e}")
+            raise
 
     def check_hi5_signals(self, trading_day, preloaded_data=None) -> List[TradingPlan]:
         """Check Hi5 strategy for trading signals"""
@@ -622,8 +556,6 @@ class OfflineTradingPlanner:
         rsp_data = self.price_cache.get(self.benchmark_ticker, {})
         rsp_price = rsp_data.get("current", 0)
         rsp_prev_close = rsp_data.get("previous_close", rsp_price)
-        rsp_month_start = self.state.rsp_month_start_price
-        month_start_date = self.state.month_start_date
 
         if not rsp_price:
             print("Warning: Could not get RSP price")
@@ -634,34 +566,12 @@ class OfflineTradingPlanner:
             self.state.current_month is None
             or self.state.current_month != trading_day.month
         ):
-            # Find the first natural trading day of the month in the data
-            if preloaded_data is not None:
-                # Multi-index DataFrame: (ticker, field)
-                dates = preloaded_data.index
-                # Find first date in this month with RSP data
-                for dt in dates:
-                    if dt.month == trading_day.month:
-                        try:
-                            price = preloaded_data[(self.benchmark_ticker, "Close")].loc[dt]
-                            if not pd.isna(price):
-                                self.state.rsp_month_start_price = price
-                                self.state.month_start_date = dt.strftime('%Y-%m-%d')
-                                break
-                        except Exception:
-                            continue
-                else:
-                    self.state.rsp_month_start_price = rsp_price
-                    self.state.month_start_date = trading_day.strftime('%Y-%m-%d')
-            else:
-                # Fallback: use current day
-                self.state.rsp_month_start_price = rsp_price
-                self.state.month_start_date = trading_day.strftime('%Y-%m-%d')
             self.state.current_month = trading_day.month
             self.state.first_exec = False
             self.state.second_exec = False
             self.state.third_exec = False
             self.state.save_state()
-            print(f"Month refreshed: {trading_day.month}, RSP start: ${self.state.rsp_month_start_price:.2f} on {self.state.month_start_date}")
+            print(f"Month refreshed: {trading_day.month}")
 
         # Check for buy signals
         # 1. First monthly investment
@@ -669,8 +579,7 @@ class OfflineTradingPlanner:
             daily_return = (rsp_price / rsp_prev_close - 1) if rsp_prev_close else 0
             if daily_return <= -0.01:
                 reason = (
-                    f"RSP daily drop <= -1%: Month start ${self.state.rsp_month_start_price:.2f} (on {self.state.month_start_date}), "
-                    f"Current ${rsp_price:.2f}, Daily change {daily_return*100:+.2f}%"
+                    f"RSP daily drop <= -1%: Current ${rsp_price:.2f}, Daily change {daily_return*100:+.2f}%"
                 )
                 plans.extend(self._create_trading_plans(reason))
                 self.state.first_exec = True
@@ -679,19 +588,58 @@ class OfflineTradingPlanner:
                 self.state.first_exec = True
 
         # 2. Second investment on larger drop
-        if not self.state.second_exec and self.state.rsp_month_start_price:
-            mtd_return = (rsp_price / self.state.rsp_month_start_price) - 1
-            if mtd_return <= -0.05:
-                reason = (
-                    f"RSP MTD drop <= -5%: Month start ${self.state.rsp_month_start_price:.2f} (on {self.state.month_start_date}), "
-                    f"Current ${rsp_price:.2f}, MTD change {mtd_return*100:+.2f}%"
-                )
-                plans.extend(self._create_trading_plans(reason, multiplier=3))
-                self.state.second_exec = True
+        if not self.state.second_exec:
+            # Get the first trading day of the month for MTD calculation
+            query = f"""
+            SELECT MIN(date) as first_date
+            FROM `{self.project_id}.market_data.marketing`
+            WHERE date >= DATE_TRUNC(DATE('{trading_day.strftime('%Y-%m-%d')}'), MONTH)
+            AND ticker = '{self.benchmark_ticker}'
+            """
+            result = self.bq_client.query(query).result()
+            first_date = next(result).first_date
+            
+            if first_date:
+                # Get the price for the first date
+                price_query = f"""
+                SELECT adj_close
+                FROM `{self.project_id}.market_data.marketing`
+                WHERE date = DATE('{first_date}')
+                AND ticker = '{self.benchmark_ticker}'
+                """
+                price_result = self.bq_client.query(price_query).result()
+                price_row = next(price_result)
+                month_start_price = price_row.adj_close
+                
+                mtd_return = (rsp_price / month_start_price) - 1
+                if mtd_return <= -0.05:
+                    reason = (
+                        f"RSP MTD drop <= -5%: Month start ${month_start_price:.2f} (on {first_date}), "
+                        f"Current ${rsp_price:.2f}, MTD change {mtd_return*100:+.2f}%"
+                    )
+                    plans.extend(self._create_trading_plans(reason, multiplier=3))
+                    self.state.second_exec = True
+
+        # 3. Human extreme condition
+        if not self.state.third_exec:
+            extreme_query = f"""
+            SELECT ema20_ratio
+            FROM `{self.project_id}.market_data.market_breadth`
+            WHERE date = DATE('{trading_day.strftime('%Y-%m-%d')}')
+            """
+            extreme_result = self.bq_client.query(extreme_query).result()
+            for row in extreme_result:
+                if row.ema20_ratio <= 0.2:  # Human extreme condition: less than 20% above EMA20
+                    reason = (
+                        f"Human extreme condition triggered: EMA20 ratio = {row.ema20_ratio:.2%}"
+                    )
+                    plans.extend(self._create_trading_plans(reason, multiplier=5))  # 5x contribution
+                    self.state.third_exec = True
 
         # Save state after checking
         if plans:
             self.state.save_state()
+            print(f"Current State: First={self.state.first_exec}, Second={self.state.second_exec}, Third={self.state.third_exec}")
 
         return plans
 
@@ -827,7 +775,7 @@ class OfflineTradingPlanner:
         else:
             print("\nNo trading signals at this time.")
             print(
-                f"Current state: Month={self.state.current_month}, Month_Start={self.state.rsp_month_start_price} (on {self.state.month_start_date}), First={self.state.first_exec}, Second={self.state.second_exec}"
+                f"Current state: Month={self.state.current_month}, First={self.state.first_exec}, Second={self.state.second_exec}"
             )
             # Send heartbeat email if email_manager is enabled
             if self.email_manager and self.recipient_email:
@@ -841,7 +789,6 @@ This is an automated message to confirm the Hi5 Offline Trading Planner is runni
 
 Current state:
 - Month: {self.state.current_month}
-- Month Start: {self.state.rsp_month_start_price} (on {self.state.month_start_date})
 - First Exec: {self.state.first_exec}
 - Second Exec: {self.state.second_exec}
 
@@ -973,15 +920,6 @@ def main():
         help="Path to GCP config file (default: gcp_config.json)",
         default="gcp-config.json",
     )
-    parser.add_argument(
-        "--use-bigquery",
-        action="store_true",
-        help="Use BigQuery instead of yfinance for market data",
-    )
-    parser.add_argument(
-        "--project-id",
-        help="GCP project ID (required when using BigQuery)",
-    )
 
     args = parser.parse_args()
 
@@ -1040,52 +978,45 @@ def main():
         "bucket_name": gcp_config.get("bucket_name") if args.engine == "gcp" else None,
         "blob_name": gcp_config.get("blob_name") if args.engine == "gcp" else None,
         "credentials_path": gcp_config.get("credentials_path"),
-        "use_bigquery": args.use_bigquery,
-        "project_id": args.project_id,
+        "project_id": gcp_config.get("project_id"),
     }
 
     # Create planner
     planner = OfflineTradingPlanner(**config)
 
-    # Efficient batch download for all tickers and all dates (even if only one date)
-    start_date = test_dates[0]
-    end_date = test_dates[-1]
-    download_start = start_date - datetime.timedelta(days=40)
-    print(
-        f"Batch downloading all ticker data from {download_start.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
-    )
-    all_tickers = planner.tickers + [planner.benchmark_ticker]
+    # Get trading days from BigQuery
+    trading_days_query = f"""
+    SELECT DISTINCT date
+    FROM `{planner.project_id}.market_data.marketing`
+    WHERE date >= DATE('{test_dates[0].strftime('%Y-%m-%d')}')
+    AND date <= DATE('{test_dates[-1].strftime('%Y-%m-%d')}')
+    ORDER BY date
+    """
     
-    if not args.use_bigquery:
-        data = yf.download(
-            all_tickers,
-            start=download_start.strftime("%Y-%m-%d"),
-            end=(end_date + datetime.timedelta(days=1)).strftime("%Y-%m-%d"),
-            group_by="ticker",
-            progress=False,
-            auto_adjust=False,
-        )
-        if len(all_tickers) == 1:
-            data = {all_tickers[0]: data}
-        available_dates = data.index
-    else:
-        data = None
-        available_dates = None
+    trading_days_result = planner.bq_client.query(trading_days_query).result()
+    trading_days = [row.date for row in trading_days_result]
+    
+    if not trading_days:
+        print(f"No trading days found in BigQuery for the specified date range")
+        return
+
+    print(f"Found {len(trading_days)} trading days in BigQuery")
 
     for d in test_dates:
         d_ts = pd.Timestamp(d)
-        if not args.use_bigquery:
-            prev_trading_days = available_dates[available_dates < d_ts]
-            if len(prev_trading_days) == 0:
-                print(
-                    f"Skipping {d.strftime('%Y-%m-%d')}: no previous trading day available."
-                )
-                continue
-            prev_trading_day = prev_trading_days[-1]
-        else:
-            prev_trading_day = d
+        # Find the previous trading day from BigQuery results
+        prev_trading_days = [td for td in trading_days if td <= d_ts.date()]
+        if not prev_trading_days:
+            print(f"Skipping {d.strftime('%Y-%m-%d')}: no previous trading day available.")
+            continue
+            
+        prev_trading_day = prev_trading_days[-1]
+        print(f"Processing {d.strftime('%Y-%m-%d')} using market data from {prev_trading_day}")
+        
+        # Update market data and run planning cycle
+        planner.update_market_data(prev_trading_day)
         planner.run_planning_cycle(
-            decision_day=d, market_data_day=prev_trading_day, preloaded_data=data
+            decision_day=d, market_data_day=prev_trading_day
         )
 
 
