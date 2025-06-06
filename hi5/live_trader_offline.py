@@ -622,13 +622,13 @@ class OfflineTradingPlanner:
         # 3. Human extreme condition
         if not self.state.third_exec:
             extreme_query = f"""
-            SELECT ema20_ratio
+            SELECT ma50_ratio
             FROM `{self.project_id}.market_data.market_breadth`
             WHERE date = DATE('{trading_day.strftime('%Y-%m-%d')}')
             """
             extreme_result = self.bq_client.query(extreme_query).result()
             for row in extreme_result:
-                if row.ema20_ratio <= 0.2:  # Human extreme condition: less than 20% above EMA20
+                if row.ema20_ratio <= 0.15:  # Human extreme condition: less than 20% above EMA20
                     reason = (
                         f"Human extreme condition triggered: EMA20 ratio = {row.ema20_ratio:.2%}"
                     )
