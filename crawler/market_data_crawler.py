@@ -17,36 +17,35 @@ import pytz
 
 # Set up logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
 
 class MarketDataCrawler:
     def __init__(self, gcp_config_path: str, smtp_config_path: str):
         """Initialize the MarketDataCrawler with BigQuery credentials."""
         # Set timezone
-        self.timezone = pytz.timezone('America/New_York')
-        
+        self.timezone = pytz.timezone("America/New_York")
+
         # Load GCP configuration
-        with open(gcp_config_path, 'r') as f:
+        with open(gcp_config_path, "r") as f:
             gcp_config = json.load(f)
-        
+
         self.credentials = service_account.Credentials.from_service_account_file(
-            gcp_config['credentials_path']
+            gcp_config["credentials_path"]
         )
         self.client = bigquery.Client(
-            credentials=self.credentials,
-            project=gcp_config['project_id']
+            credentials=self.credentials, project=gcp_config["project_id"]
         )
-        self.project_id = gcp_config['project_id']
+        self.project_id = gcp_config["project_id"]
         self.dataset_id = "market_data"
         self.market_breadth_table = "market_breadth"
-        
+
         # Load SMTP configuration
-        with open(smtp_config_path, 'r') as f:
+        with open(smtp_config_path, "r") as f:
             self.smtp_config = json.load(f)
-        
+
         # Initialize dataset and tables if they don't exist
         self._initialize_bigquery_tables()
 
@@ -123,16 +122,18 @@ class MarketDataCrawler:
         self.client.query(breadth_query).result()
         logger.info(f"Table {self.market_breadth_table} created or already exists")
 
-    def get_symbols_from_bigquery(self, is_sp500: bool = False, specific_tickers: Optional[List[str]] = None) -> List[str]:
+    def get_symbols_from_bigquery(
+        self, is_sp500: bool = False, specific_tickers: Optional[List[str]] = None
+    ) -> List[str]:
         """Get tickers from crawler_tickers table.
-        
+
         Args:
             is_sp500: If True, only return S&P 500 tickers. If False, return all tickers.
             specific_tickers: Optional list of specific tickers to validate and return.
-            
+
         Returns:
             List of ticker symbols
-            
+
         Raises:
             RuntimeError: If any of the specific tickers don't exist in crawler_tickers table
         """
@@ -144,23 +145,23 @@ class MarketDataCrawler:
             WHERE ticker IN UNNEST(@tickers)
             {f"AND is_sp500 = TRUE" if is_sp500 else ""}
             """
-            
+
             job_config = bigquery.QueryJobConfig(
                 query_parameters=[
                     bigquery.ArrayQueryParameter("tickers", "STRING", specific_tickers)
                 ]
             )
-            
+
             result = self.client.query(query, job_config=job_config).result()
             found_tickers = {row.ticker for row in result}
-            
+
             # Check for missing tickers
             missing_tickers = set(specific_tickers) - found_tickers
             if missing_tickers:
                 raise RuntimeError(
                     f"The following tickers do not exist in crawler_tickers table: {', '.join(sorted(missing_tickers))}"
                 )
-            
+
             symbols = list(found_tickers)
         else:
             # Get all tickers (existing behavior)
@@ -172,20 +173,28 @@ class MarketDataCrawler:
             """
             result = self.client.query(query).result()
             symbols = [row.ticker for row in result]
-        
+
         if not symbols:
-            raise ValueError(f"No {'S&P 500 ' if is_sp500 else ''}symbols found in crawler_tickers table")
-        
-        logger.info(f"Loaded {len(symbols)} {'S&P 500 ' if is_sp500 else ''}symbols from BigQuery")
+            raise ValueError(
+                f"No {'S&P 500 ' if is_sp500 else ''}symbols found in crawler_tickers table"
+            )
+
+        logger.info(
+            f"Loaded {len(symbols)} {'S&P 500 ' if is_sp500 else ''}symbols from BigQuery"
+        )
         return symbols
 
-    def update_market_breadth(self, start_date: Optional[datetime.datetime] = None, end_date: Optional[datetime.datetime] = None):
+    def update_market_breadth(
+        self,
+        start_date: Optional[datetime.datetime] = None,
+        end_date: Optional[datetime.datetime] = None,
+    ):
         """Directly calculate and update market breadth metrics in BigQuery for the given date range."""
         if end_date is None:
             end_date = datetime.datetime.now(self.timezone)
         else:
             end_date = self.timezone.localize(end_date.replace(tzinfo=None))
-        
+
         if start_date is None:
             # Get the last date in the market breadth table
             query = f"""
@@ -201,9 +210,29 @@ class MarketDataCrawler:
         else:
             start_date = self.timezone.localize(start_date.replace(tzinfo=None))
 
-        print(f"update market breadth start_date: {start_date}, end_date: {end_date}")
-
         merge_sql = f"""
+        INSERT INTO `{self.project_id}.{self.dataset_id}.market_breadth` (
+    date,
+    ma20_above,
+    ma20_below,
+    ma50_above,
+    ma50_below,
+    ma200_above,
+    ma200_below,
+    ma20_ratio,
+    ma50_ratio,
+    ma200_ratio,
+    ema20_above,
+    ema20_below,
+    ema50_above,
+    ema50_below,
+    ema200_above,
+    ema200_below,
+    ema20_ratio,
+    ema50_ratio,
+    ema200_ratio,
+    update_time
+)
        SELECT
     m.date,
     COUNTIF(adj_close > ma20) as ma20_above,
@@ -234,15 +263,18 @@ WHERE m.date >= '{start_date.strftime('%Y-%m-%d')}'
 GROUP BY date
 ORDER BY date;
         """
-        
+
         self.client.query(merge_sql).result()
         logger.info("Market breadth update completed successfully")
 
-    def update_market_data(self, start_date: Optional[datetime.datetime] = None, 
-                          end_date: Optional[datetime.datetime] = None,
-                          specific_tickers: Optional[List[str]] = None):
+    def update_market_data(
+        self,
+        start_date: Optional[datetime.datetime] = None,
+        end_date: Optional[datetime.datetime] = None,
+        specific_tickers: Optional[List[str]] = None,
+    ):
         """Update market data and calculate market breadth.
-        
+
         Args:
             start_date: Optional start date for data update
             end_date: Optional end date for data update
@@ -257,7 +289,7 @@ ORDER BY date;
             end_date = datetime.datetime.now(self.timezone)
         else:
             end_date = self.timezone.localize(end_date.replace(tzinfo=None))
-        
+
         if start_date is None:
             # Get the last date in the marketing table
             query = f"""
@@ -275,7 +307,9 @@ ORDER BY date;
         else:
             start_date = self.timezone.localize(start_date.replace(tzinfo=None))
 
-        logger.info(f"Updating data from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+        logger.info(
+            f"Updating data from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
+        )
 
         # Download data for all symbols at once
         logger.info("Downloading data for all symbols...")
@@ -286,7 +320,7 @@ ORDER BY date;
             progress=False,
             auto_adjust=False,
             actions=True,
-            group_by='ticker',
+            group_by="ticker",
         )
 
         if df.empty:
@@ -297,24 +331,26 @@ ORDER BY date;
         for symbol in symbols:
             # Get data for this symbol
             symbol_data = df[symbol].copy()
-            
+
             if symbol_data.empty:
                 logger.warning(f"No data available for {symbol}")
                 continue
 
             # Prepare data for BigQuery
-            symbol_data.loc[:, 'ticker'] = symbol
+            symbol_data.loc[:, "ticker"] = symbol
             symbol_data = symbol_data.reset_index()
-            symbol_data = symbol_data.rename(columns={'Date': 'date'})
-            symbol_data = symbol_data.rename(columns={'Adj Close': 'adj_close'})
-            symbol_data = symbol_data.rename(columns={'Dividends': 'dividend'})
-            symbol_data = symbol_data.rename(columns={'Close': 'close'})
-            symbol_data = symbol_data.rename(columns={'Stock Splits': 'split_ratio'})
-            symbol_data = symbol_data.rename(columns={'Capital Gains': 'capital_gains'})
-            symbol_data['Volume'] = symbol_data['Volume'].fillna(0).round(0).astype(pd.Int64Dtype())
+            symbol_data = symbol_data.rename(columns={"Date": "date"})
+            symbol_data = symbol_data.rename(columns={"Adj Close": "adj_close"})
+            symbol_data = symbol_data.rename(columns={"Dividends": "dividend"})
+            symbol_data = symbol_data.rename(columns={"Close": "close"})
+            symbol_data = symbol_data.rename(columns={"Stock Splits": "split_ratio"})
+            symbol_data = symbol_data.rename(columns={"Capital Gains": "capital_gains"})
+            symbol_data["Volume"] = (
+                symbol_data["Volume"].fillna(0).round(0).astype(pd.Int64Dtype())
+            )
 
             # Add update_time
-            symbol_data['update_time'] = datetime.datetime.now(self.timezone)
+            symbol_data["update_time"] = datetime.datetime.now(self.timezone)
 
             # Upload to BigQuery
             table_ref = f"{self.project_id}.{self.dataset_id}.marketing"
@@ -328,14 +364,14 @@ ORDER BY date;
 
     def deduplicate_tables(self, categories: List[str]):
         """Deduplicate tables based on the categories that were processed.
-        
+
         Args:
             categories: List of categories that were processed in this run
         """
         logger.info("Starting table deduplication...")
-        
+
         # Deduplicate market_breadth table if breadth was processed
-        if 'breadth' in categories:
+        if "breadth" in categories:
             market_breadth_dedup_query = f"""
             CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.{self.market_breadth_table}` AS
             SELECT * EXCEPT(row_num)
@@ -351,7 +387,7 @@ ORDER BY date;
             logger.info("Market breadth table deduplication completed")
 
         # Deduplicate marketing table if market data was processed
-        if 'market' in categories:
+        if "market" in categories:
             marketing_dedup_query = f"""
             CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.marketing` AS
             SELECT * EXCEPT(row_num)
@@ -367,7 +403,7 @@ ORDER BY date;
             logger.info("Marketing table deduplication completed")
 
         # Deduplicate technical indicators table if indicators were processed
-        if 'indicators' in categories:
+        if "indicators" in categories:
             indicators_dedup_query = f"""
             CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.technical_indicators` AS
             SELECT * EXCEPT(row_num)
@@ -384,7 +420,7 @@ ORDER BY date;
 
     def send_notification(self, subject: str, body: str, recipient_email: str):
         """Send email notification using SMTP configuration.
-        
+
         Args:
             subject: Email subject
             body: Email body content
@@ -392,25 +428,29 @@ ORDER BY date;
         """
         try:
             msg = MIMEMultipart()
-            msg['From'] = self.smtp_config['username']
-            msg['To'] = recipient_email
-            msg['Subject'] = subject
+            msg["From"] = self.smtp_config["username"]
+            msg["To"] = recipient_email
+            msg["Subject"] = subject
 
-            msg.attach(MIMEText(body, 'plain'))
+            msg.attach(MIMEText(body, "plain"))
 
-            with smtplib.SMTP(self.smtp_config['server'], self.smtp_config['port']) as server:
-                if self.smtp_config.get('use_tls', True):
+            with smtplib.SMTP(
+                self.smtp_config["server"], self.smtp_config["port"]
+            ) as server:
+                if self.smtp_config.get("use_tls", True):
                     server.starttls()
-                server.login(self.smtp_config['username'], self.smtp_config['password'])
+                server.login(self.smtp_config["username"], self.smtp_config["password"])
                 server.send_message(msg)
-            
+
             logger.info("Email notification sent successfully")
         except Exception as e:
             logger.error(f"Failed to send email notification: {str(e)}")
 
-    def send_crawler_notification(self, categories: List[str], recipient_email: str, success: bool = True):
+    def send_crawler_notification(
+        self, categories: List[str], recipient_email: str, success: bool = True
+    ):
         """Send crawler completion notification.
-        
+
         Args:
             categories: List of categories that were processed
             recipient_email: Email address to send notification to
@@ -418,19 +458,23 @@ ORDER BY date;
         """
         status = "Successfully" if success else "Failed to"
         subject = f"Market Data Crawler {status} Complete"
-        
+
         body = f"""
 Market Data Crawler has {status.lower()} completed the following operations:
 {', '.join(categories)}
 
 Timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         """
-        
+
         self.send_notification(subject, body, recipient_email)
 
-    def update_technical_indicators(self, start_date: Optional[datetime.datetime] = None, end_date: Optional[datetime.datetime] = None):
+    def update_technical_indicators(
+        self,
+        start_date: Optional[datetime.datetime] = None,
+        end_date: Optional[datetime.datetime] = None,
+    ):
         """Calculate and update technical indicators using BigQuery SQL.
-        
+
         Args:
             start_date: Optional start date for calculation. The function will look back 200 days from this date.
             end_date: Optional end date for calculation. The function will look back 200 days from this date.
@@ -439,7 +483,7 @@ Timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             end_date = datetime.datetime.now(self.timezone)
         else:
             end_date = self.timezone.localize(end_date.replace(tzinfo=None))
-        
+
         if start_date is None:
             # Get the last date in the technical indicators table
             query = f"""
@@ -459,8 +503,10 @@ Timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
         # Calculate the lookback start date (200 days before the start_date)
         lookback_start = start_date - datetime.timedelta(days=400)
-        
-        logger.info(f"Updating technical indicators from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+
+        logger.info(
+            f"Updating technical indicators from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
+        )
 
         # Calculate technical indicators using window functions
         merge_query = f"""
@@ -555,9 +601,10 @@ FROM
 WHERE
     date >= '{lookback_start.strftime('%Y-%m-%d')}'
         """
-        
+
         self.client.query(merge_query).result()
         logger.info("Technical indicators update completed successfully")
+
 
 def main():
     """Main entry point for the crawler."""
@@ -567,34 +614,34 @@ def main():
     parser.add_argument(
         "--gcp-config",
         default="gcp-config.json",
-        help="Path to GCP configuration JSON file"
+        help="Path to GCP configuration JSON file",
     )
     parser.add_argument(
         "--smtp-config",
         default="smtp-config.json",
-        help="Path to SMTP configuration JSON file"
+        help="Path to SMTP configuration JSON file",
     )
     parser.add_argument(
         "--email",
         default="zgxcassar@gmail.com",
-        help="Email address to send notifications to"
+        help="Email address to send notifications to",
     )
     parser.add_argument(
         "--start-date",
-        help="Start date for data update (YYYY-MM-DD). If not provided, uses last date in database or 90 days ago."
+        help="Start date for data update (YYYY-MM-DD). If not provided, uses last date in database or 90 days ago.",
     )
     parser.add_argument(
         "--end-date",
-        help="End date for data update (YYYY-MM-DD). If not provided, uses current date."
+        help="End date for data update (YYYY-MM-DD). If not provided, uses current date.",
     )
     parser.add_argument(
         "--tickers",
-        help="Comma-separated list of tickers to process. If not provided, processes all tickers from crawler_tickers table."
+        help="Comma-separated list of tickers to process. If not provided, processes all tickers from crawler_tickers table.",
     )
     parser.add_argument(
         "--crawl",
         default="market,indicators,breadth,dedup",
-        help="Comma-separated list of operations to perform. Options: market (crawl market data), indicators (calculate technical indicators), breadth (calculate market breadth), dedup (deduplicate tables). Default: market,breadth,dedup"
+        help="Comma-separated list of operations to perform. Options: market (crawl market data), indicators (calculate technical indicators), breadth (calculate market breadth), dedup (deduplicate tables). Default: market,breadth,dedup",
     )
 
     args = parser.parse_args()
@@ -602,21 +649,21 @@ def main():
     # Parse dates if provided
     start_date = None
     end_date = None
-    
+
     if args.start_date:
         try:
             # Parse the date and localize it to New York timezone
             start_date = datetime.datetime.strptime(args.start_date, "%Y-%m-%d")
-            start_date = pytz.timezone('America/New_York').localize(start_date)
+            start_date = pytz.timezone("America/New_York").localize(start_date)
         except ValueError:
             logger.error("Invalid start date format. Use YYYY-MM-DD")
             sys.exit(1)
-    
+
     if args.end_date:
         try:
             # Parse the date and localize it to New York timezone
             end_date = datetime.datetime.strptime(args.end_date, "%Y-%m-%d")
-            end_date = pytz.timezone('America/New_York').localize(end_date)
+            end_date = pytz.timezone("America/New_York").localize(end_date)
         except ValueError:
             logger.error("Invalid end date format. Use YYYY-MM-DD")
             sys.exit(1)
@@ -624,16 +671,18 @@ def main():
     # Parse tickers if provided
     specific_tickers = None
     if args.tickers:
-        specific_tickers = [ticker.strip().upper() for ticker in args.tickers.split(',')]
+        specific_tickers = [
+            ticker.strip().upper() for ticker in args.tickers.split(",")
+        ]
         if not specific_tickers:
             logger.error("No valid tickers provided")
             sys.exit(1)
 
     # Parse crawler categories
-    categories = [cat.strip().lower() for cat in args.crawl.split(',')]
-    valid_categories = {'market', 'indicators', 'breadth', 'dedup'}
+    categories = [cat.strip().lower() for cat in args.crawl.split(",")]
+    valid_categories = {"market", "indicators", "breadth", "dedup"}
     invalid_categories = set(categories) - valid_categories
-    
+
     if invalid_categories:
         logger.error(f"Invalid crawler categories: {', '.join(invalid_categories)}")
         logger.error(f"Valid categories are: {', '.join(valid_categories)}")
@@ -643,16 +692,16 @@ def main():
 
     try:
         # Execute requested operations
-        if 'market' in categories:
+        if "market" in categories:
             crawler.update_market_data(start_date, end_date, specific_tickers)
 
-        if 'indicators' in categories:
+        if "indicators" in categories:
             crawler.update_technical_indicators(start_date, end_date)
 
-        if 'breadth' in categories:
+        if "breadth" in categories:
             crawler.update_market_breadth(start_date, end_date)
 
-        if 'dedup' in categories:
+        if "dedup" in categories:
             crawler.deduplicate_tables(categories)
 
         # Send success notification
@@ -660,12 +709,13 @@ def main():
 
     except (ValueError, RuntimeError) as e:
         logger.error(f"Crawler failed: {str(e)}")
-        #crawler.send_crawler_notification(categories, args.email, success=False)
+        # crawler.send_crawler_notification(categories, args.email, success=False)
         sys.exit(1)
     except Exception as e:
         logger.error(f"Unexpected error: {str(e)}")
-        #crawler.send_crawler_notification(categories, args.email, success=False)
+        # crawler.send_crawler_notification(categories, args.email, success=False)
         sys.exit(1)
 
+
 if __name__ == "__main__":
-    main() 
+    main()

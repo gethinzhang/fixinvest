@@ -492,7 +492,6 @@ class OfflineTradingPlanner:
         all_tickers = self.tickers + [self.benchmark_ticker]
         self.price_cache = {}
 
-        print(f"Fetching data from BigQuery for {trading_day.strftime('%Y-%m-%d')}")
         try:
             # Get current day data
             current_query = f"""
@@ -539,9 +538,9 @@ class OfflineTradingPlanner:
                     "change": row['change'],
                     "change_percent": row['change_percent'],
                 }
-                print(
-                    f"{ticker}: ${row['close']:.2f} (Prev: ${row['prev_close']:.2f}, {row['change_percent']:+.2f}%)"
-                )
+                #print(
+                #    f"{ticker}: ${row['close']:.2f} (Prev: ${row['prev_close']:.2f}, {row['change_percent']:+.2f}%)"
+                #)
 
         except Exception as e:
             print(f"Error fetching data from BigQuery: {e}")
@@ -775,7 +774,7 @@ class OfflineTradingPlanner:
         else:
             print("\nNo trading signals at this time.")
             print(
-                f"Current state: Month={self.state.current_month}, First={self.state.first_exec}, Second={self.state.second_exec}"
+                f"Current state: Month={self.state.current_month}, First={self.state.first_exec}, Second={self.state.second_exec} Third={self.state.third_exec}"
             )
             # Send heartbeat email if email_manager is enabled
             if self.email_manager and self.recipient_email:

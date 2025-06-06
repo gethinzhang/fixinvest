@@ -581,8 +581,6 @@ class BacktestAnalyzer(bt.Analyzer):
                     return monthly_irr, annual_irr
             
             return None, None
-        except:
-            return None, None
 
     def capture_final_positions(self, strategy):
         """Capture final positions from the strategy including dividend tracking"""
@@ -898,3 +896,155 @@ class BacktestAnalyzer(bt.Analyzer):
         print(f"Net profit: ${net_profit:,.2f}")
         
         return filename
+
+class Hi5Strategy(bt.Strategy):
+    """Hi5 Strategy implementation"""
+    
+    params = (
+        ('enable_cash_injection', True),
+        ('cash_injection_threshold', 5),
+        ('cash_per_contribution', 10000),
+        ('non_resident_tax_rate', 0.3),
+        ('market_breadth_df', None),  # Add market breadth DataFrame as a parameter
+        ('state', InMemoryStorageEngine()),  # Add state parameter
+        ('tickers', []),  # Add tickers parameter
+    )
+
+    def __init__(self):
+        """Initialize strategy"""
+        self.state = self.p.state
+        self.tickers = self.p.tickers
+        self.benchmark_ticker = "RSP"
+        
+        # Store data feeds
+        self.data_feeds = {}
+        for ticker in self.tickers + [self.benchmark_ticker]:
+            self.data_feeds[ticker] = self.getdatabyname(ticker)
+        
+        # Initialize market breadth indicator
+        if self.p.market_breadth_df is not None:
+            self.market_breadth = MarketBreadthIndicator(
+                self.data_feeds[self.benchmark_ticker],
+                market_breadth_df=self.p.market_breadth_df
+            )
+        
+        # Initialize state if needed
+        if not hasattr(self.state, 'current_month'):
+            self.state.current_month = None
+            self.state.first_exec = False
+            self.state.second_exec = False
+            self.state.third_exec = False
+            self.state.save_state()
+        
+        # Track cash injections
+        self.total_cash_injected = 0
+        self.cash_injection_history = []
+        
+        # Track dividend cash
+        self.total_dividend_cash_received = 0
+
+    def next(self):
+        """Main strategy logic"""
+        # Get current date
+        current_date = self.data.datetime.date(0)
+        
+        # Month refresh logic
+        if self.state.current_month is None or self.state.current_month != current_date.month:
+            self.state.current_month = current_date.month
+            self.state.first_exec = False
+            self.state.second_exec = False
+            self.state.third_exec = False
+            self.state.save_state()
+            print(f"Month refreshed: {current_date.month}")
+
+        # Get RSP data
+        rsp_data = self.data_feeds[self.benchmark_ticker]
+        rsp_price = rsp_data.close[0]
+        rsp_prev_close = rsp_data.close[-1]
+
+        # Check for buy signals
+        # 1. First monthly investment
+        if not self.state.first_exec:
+            daily_return = (rsp_price / rsp_prev_close - 1) if rsp_prev_close else 0
+            if daily_return <= -0.01:
+                reason = f"RSP daily drop <= -1%: Current ${rsp_price:.2f}, Daily change {daily_return*100:+.2f}%"
+                self._execute_trades(reason)
+                self.state.first_exec = True
+            elif self._is_third_week_end(current_date):
+                self._execute_trades("Third week end")
+                self.state.first_exec = True
+
+        # 2. Second investment on larger drop
+        if not self.state.second_exec:
+            # Calculate MTD return
+            month_start = current_date.replace(day=1)
+            month_start_price = None
+            for i in range(len(rsp_data)):
+                if rsp_data.datetime.date(i) >= month_start:
+                    month_start_price = rsp_data.close[i]
+                    break
+            
+            if month_start_price:
+                mtd_return = (rsp_price / month_start_price) - 1
+                if mtd_return <= -0.05:
+                    reason = f"RSP MTD drop <= -5%: Month start ${month_start_price:.2f}, Current ${rsp_price:.2f}, MTD change {mtd_return*100:+.2f}%"
+                    self._execute_trades(reason, multiplier=3)
+                    self.state.second_exec = True
+
+        # 3. Human extreme condition
+        if not self.state.third_exec and hasattr(self, 'market_breadth'):
+            current_breadth = self.market_breadth.lines.ema20_ratio[0]
+            market_breadth = self.market_breadth.lines.market_breadth[0]
+            if current_breadth <= 0.2 and market_breadth < 0:  # Human extreme condition: less than 20% above EMA20 and negative market breadth
+                reason = f"Human extreme condition triggered: EMA20 ratio = {current_breadth:.2%}, Market Breadth = {market_breadth:.2%}"
+                self._execute_trades(reason, multiplier=5)  # 5x contribution
+                self.state.third_exec = True
+
+        # Save state after checking
+        if any([self.state.first_exec, self.state.second_exec, self.state.third_exec]):
+            self.state.save_state()
+
+    def _execute_trades(self, reason, multiplier=1):
+        """Execute trades for all tickers"""
+        total_investment = self.p.cash_per_contribution * multiplier
+        investment_per_ticker = total_investment / len(self.tickers)
+
+        for ticker in self.tickers:
+            data = self.data_feeds[ticker]
+            price = data.close[0]
+            
+            if price and price > 0:
+                shares = int(investment_per_ticker / price)
+                if shares > 0:
+                    self.buy(data=data, size=shares, reason=reason)
+
+    def _is_third_week_end(self, current_date):
+        """Check if today is the end of third week"""
+        day = current_date.day
+        # Between 15-21 and it's Thursday or Friday
+        if 15 <= day <= 21 and current_date.weekday() in [3, 4]:
+            return True
+        return False
+
+class MarketBreadthIndicator(bt.Indicator):
+    """Market Breadth Indicator that tracks EMA20 ratio and market breadth"""
+    lines = ('ema20_ratio', 'market_breadth')  # Define both indicator lines
+    params = (('market_breadth_df', None),)  # Parameter to store the market breadth DataFrame
+
+    def __init__(self):
+        super(MarketBreadthIndicator, self).__init__()
+        self.market_breadth_df = self.p.market_breadth_df
+        if self.market_breadth_df is None:
+            raise ValueError("market_breadth_df must be provided")
+
+    def next(self):
+        """Calculate the next value of the indicator"""
+        current_date = self.data.datetime.date(0)
+        try:
+            # Set EMA20 ratio
+            self.lines.ema20_ratio[0] = self.market_breadth_df.loc[current_date, 'ema20_ratio']
+            # Set market breadth indicator
+            self.lines.market_breadth[0] = self.market_breadth_df.loc[current_date, 'market_breadth']
+        except KeyError:
+            self.lines.ema20_ratio[0] = 0.0  # Default value if date not found
+            self.lines.market_breadth[0] = 0.0  # Default value if date not found

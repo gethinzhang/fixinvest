@@ -25,24 +25,29 @@ COMMISSION_RATE = 0.001
 RISK_FREE_RATE = 0.04
 
 
-def setup_cerebro(strategy_tickers):
+def setup_cerebro(strategy_tickers, market_breadth_df=None):
     """Setup cerebro with strategy and analyzers"""
     cerebro = bt.Cerebro(stdstats=False)
     
     # Setup Hi5 strategy state
-    # storage_engine = LocalStorageEngine(local_file_path="./hi5_strategy_state.json")
     storage_engine = InMemoryStorageEngine()
     hi5_state = Hi5State(storage_engine=storage_engine)
 
+    # Calculate market breadth indicator if data is provided
+    if market_breadth_df is not None:
+        market_breadth_df = market_breadth_df.copy()
+        market_breadth_df['market_breadth'] = market_breadth_indicator(market_breadth_df)
+
     # Add Hi5 strategy
     cerebro.addstrategy(
-        Hi5Strategy, 
+        Hi5Strategy,
         state=hi5_state, 
         tickers=strategy_tickers,
         enable_cash_injection=True,  # Enable for backtesting
         cash_injection_threshold=5,  # Maintain 3x cash_per_contribution
         cash_per_contribution=10000,
         non_resident_tax_rate=0.3,  # Set to 0 for US residents, 0.3 for non-residents
+        market_breadth_df=market_breadth_df,  # Pass market breadth data as parameter
     )
 
     # Setup broker
@@ -160,17 +165,21 @@ def run_backtest():
     
     # Strategy configuration
     strategy_tickers = ["VUG", "VO", "MOAT", "PFF", "VNQ"]
-    benchmark_tickers = ["RSP"]
+    benchmark_ticker = "RSP"
 
     # Download data for all tickers (trading + benchmark)
-    all_tickers = strategy_tickers + benchmark_tickers
-    cerebro = setup_cerebro(strategy_tickers)
-    print(f"Downloading data for {len(all_tickers)} tickers...")
-    # data_dict = download_multiple_tickers(all_tickers, START_DATE, END_DATE)
+    all_tickers = strategy_tickers + [benchmark_ticker]
+    
+    # Load data from BigQuery
+    data_dict = load_bigquery_data(all_tickers, START_DATE, END_DATE, "gcp-config.json", "hi5-strategy")
+    market_breadth_df = load_market_breadth(START_DATE, END_DATE, "gcp-config.json", "hi5-strategy")
     
     if not data_dict:
         print("Error: No data downloaded. Exiting.")
         return
+    
+    # Setup cerebro with market breadth data
+    cerebro = setup_cerebro(strategy_tickers, market_breadth_df)
     
     # Add data feeds
     feeds_added = add_data_feeds(cerebro, all_tickers, data_dict)
@@ -181,35 +190,30 @@ def run_backtest():
     print(f"\nStarting backtest from {START_DATE.strftime('%Y-%m-%d')} to {END_DATE.strftime('%Y-%m-%d')}...")
     
     # Run backtest
-    try:
-        results = cerebro.run()
-        print("Backtest completed successfully!")
-        
-        # Get strategy instance and capture final positions
-        strategy_instance = results[0]
-        strategy_instance.analyzers.hi5analyzer.capture_final_positions(strategy_instance)
-        
-        # Print results
-        print_results(strategy_instance)
-        
-        # Export to Excel
-        hi5_analysis = strategy_instance.analyzers.hi5analyzer.get_analysis()
-        
-        excel_file = strategy_instance.analyzers.hi5analyzer.export_to_excel(
-            tickers=strategy_tickers,
-            start_date=START_DATE,
-            end_date=END_DATE,
-        )
-        print(f"\nDetailed results exported to: {excel_file}")
-        
-        # Optional plotting
-        try_plot_results(cerebro)
-        
-        return strategy_instance
-        
-    except Exception as e:
-        print(f"Error during backtest execution: {e}")
-        return None
+    results = cerebro.run()
+    print("Backtest completed successfully!")
+    
+    # Get strategy instance and capture final positions
+    strategy_instance = results[0]
+    strategy_instance.analyzers.hi5analyzer.capture_final_positions(strategy_instance)
+    
+    # Print results
+    print_results(strategy_instance)
+    
+    # Export to Excel
+    hi5_analysis = strategy_instance.analyzers.hi5analyzer.get_analysis()
+    
+    excel_file = strategy_instance.analyzers.hi5analyzer.export_to_excel(
+        tickers=strategy_tickers,
+        start_date=START_DATE,
+        end_date=END_DATE,
+    )
+    print(f"\nDetailed results exported to: {excel_file}")
+    
+    # Optional plotting
+    try_plot_results(cerebro)
+    
+    return strategy_instance
 
 
 def try_plot_results(cerebro):
@@ -227,6 +231,18 @@ def try_plot_results(cerebro):
         print(f"Note: Chart plotting failed ({str(e)}), but backtest completed successfully")
 
 
+def load_gcp_config():
+    """Load GCP configuration from gcp-config.json"""
+    try:
+        with open("gcp-config.json", 'r') as f:
+            config = json.load(f)
+        if not config.get('project_id'):
+            raise ValueError("project_id not found in gcp-config.json")
+        return config
+    except Exception as e:
+        raise RuntimeError(f"Error loading GCP config: {e}")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Hi5 Backtester with BigQuery support")
     parser.add_argument('--tickers', type=str, default='VUG,VO,MOAT,PFF,VNQ', help='Comma-separated list of tickers')
@@ -234,22 +250,20 @@ def parse_args():
     parser.add_argument('--start-date', type=str, default='2012-05-01', help='Backtest start date (YYYY-MM-DD)')
     parser.add_argument('--end-date', type=str, default=None, help='Backtest end date (YYYY-MM-DD, default: today)')
     parser.add_argument('--gcp-config', type=str, default='hi5/gcp-config.json', help='Path to GCP config JSON')
-    parser.add_argument('--project-id', type=str, required=True, help='GCP project id')
     return parser.parse_args()
 
 
-def load_bigquery_data(tickers, start_date, end_date, gcp_config, project_id):
+def load_bigquery_data(tickers, start_date, end_date, gcp_config):
+    """Load market data from BigQuery"""
     # Load GCP credentials
-    with open(gcp_config, 'r') as f:
-        gcp_conf = json.load(f)
-    credentials = service_account.Credentials.from_service_account_file(gcp_conf['credentials_path'])
-    client = bigquery.Client(credentials=credentials, project=project_id)
+    credentials = service_account.Credentials.from_service_account_file(gcp_config['credentials_path'])
+    client = bigquery.Client(credentials=credentials, project=gcp_config['project_id'])
 
     # Query BigQuery for all tickers and date range
     tickers_list = ','.join([f"'{t}'" for t in tickers])
     query = f'''
-        SELECT date, ticker, open, high, low, adjclose as close, volume
-        FROM `hi5-strategy.market_data.marketing`
+        SELECT date, ticker, open, high, low, adj_close as close, volume
+        FROM `{gcp_config['project_id']}.market_data.marketing`
         WHERE ticker IN ({tickers_list})
           AND date >= '{start_date.strftime('%Y-%m-%d')}'
           AND date <= '{end_date.strftime('%Y-%m-%d')}'
@@ -268,9 +282,57 @@ def load_bigquery_data(tickers, start_date, end_date, gcp_config, project_id):
         })
         tdf['Dividends'] = 0.0  # No dividends data in table
         tdf = tdf[['date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Dividends']]
+        # Convert date to datetime
+        tdf['date'] = pd.to_datetime(tdf['date'])
         tdf.set_index('date', inplace=True)
         data_dict[ticker] = tdf
     return data_dict
+
+
+def load_market_breadth(start_date, end_date, gcp_config):
+    """Load market breadth data from BigQuery"""
+    credentials = service_account.Credentials.from_service_account_file(gcp_config['credentials_path'])
+    client = bigquery.Client(credentials=credentials, project=gcp_config['project_id'])
+
+    query = f'''
+        SELECT date, ema20_ratio
+        FROM `{gcp_config['project_id']}.market_data.market_breadth`
+        WHERE date >= '{start_date.strftime('%Y-%m-%d')}'
+          AND date <= '{end_date.strftime('%Y-%m-%d')}'
+        ORDER BY date
+    '''
+    df = client.query(query).to_dataframe()
+    if df.empty:
+        raise RuntimeError('No market breadth data returned from BigQuery for the given date range.')
+    
+    # Convert date to datetime
+    df['date'] = pd.to_datetime(df['date'])
+    df.set_index('date', inplace=True)
+    return df
+
+
+def market_breadth_indicator(market_breadth_df):
+    """Compute market breadth indicator from market_breadth_df.
+    
+    This function takes the market_breadth_df (which contains the ema20_ratio) and computes a market breadth indicator.
+    The indicator is computed as the difference between the current ema20_ratio and its 10-day moving average.
+    
+    Args:
+        market_breadth_df (pandas.DataFrame): DataFrame containing the ema20_ratio column.
+    
+    Returns:
+        pandas.Series: The computed market breadth indicator.
+    """
+    if 'ema20_ratio' not in market_breadth_df.columns:
+        raise ValueError("market_breadth_df must contain an 'ema20_ratio' column.")
+    
+    # Compute the 10-day moving average of ema20_ratio
+    ma10 = market_breadth_df['ema20_ratio'].rolling(window=10).mean()
+    
+    # Compute the market breadth indicator as the difference between current ema20_ratio and its 10-day moving average
+    indicator = market_breadth_df['ema20_ratio'] - ma10
+    
+    return indicator
 
 
 if __name__ == "__main__":
@@ -279,48 +341,54 @@ if __name__ == "__main__":
     benchmark_ticker = args.benchmark_ticker
     start_date = pd.to_datetime(args.start_date)
     end_date = pd.to_datetime(args.end_date) if args.end_date else datetime.datetime.now()
-    gcp_config = args.gcp_config
-    project_id = args.project_id
+    
+    # Load GCP configuration
+    gcp_config = load_gcp_config()
 
     print(f"Tickers: {tickers}")
     print(f"Benchmark: {benchmark_ticker}")
     print(f"Start: {start_date}")
     print(f"End: {end_date}")
-    print(f"GCP Config: {gcp_config}")
-    print(f"Project ID: {project_id}")
+    print(f"GCP Config: {args.gcp_config}")
+    print(f"Project ID: {gcp_config['project_id']}")
 
-    # Step 3/4: Load data from BigQuery and calculate EMA20/market breadth
+    # Load data from BigQuery
     all_tickers = tickers + [benchmark_ticker]
-    data_dict = load_bigquery_data(all_tickers, start_date, end_date, gcp_config, project_id)
-    # market_breadth_df is created in load_bigquery_data (side effect)
-    # For now, recalculate here for clarity
-    for t, df in data_dict.items():
-        df['ema20'] = df['Close'].ewm(span=20, adjust=False).mean()
-        data_dict[t] = df
-    all_dates = sorted(set().union(*[df.index for df in data_dict.values()]))
-    breadth = []
-    for date in all_dates:
-        count = 0
-        total = 0
-        for df in data_dict.values():
-            if date in df.index:
-                total += 1
-                if df.at[date, 'Close'] > df.at[date, 'ema20']:
-                    count += 1
-        frac = count / total if total > 0 else np.nan
-        breadth.append({'date': date, 'market_breadth': frac})
-    market_breadth_df = pd.DataFrame(breadth).set_index('date')
-    print("\nMarket Breadth (first 10 rows):\n", market_breadth_df.head(10))
+    data_dict = load_bigquery_data(all_tickers, start_date, end_date, gcp_config)
+    market_breadth_df = load_market_breadth(start_date, end_date, gcp_config)
 
-    # Step 5: Integrate with Backtrader
-    cerebro = setup_cerebro(tickers)
+    # Setup and run backtest
+    cerebro = setup_cerebro(tickers, market_breadth_df)
     feeds_added = add_data_feeds(cerebro, all_tickers, data_dict)
     if feeds_added == 0:
         print("Error: No data feeds added. Exiting.")
         exit(1)
 
-    # Pass market_breadth_df to Hi5State for use in the strategy
-    # (Assume Hi5State can accept an extra attribute for this purpose)
-    cerebro.strats[0][0].kwargs['state'].market_breadth_df = market_breadth_df
-
-    print("Backtrader setup complete. Ready for strategy integration.")
+    print("\nRunning backtest...")
+        # Run the backtest
+    results = cerebro.run()
+    strategy = results[0]
+    
+    # Get analysis results
+    analysis = strategy.analyzers.hi5analyzer.get_analysis()
+    
+    # Print key metrics
+    print("\nBacktest Results:")
+    print(f"Sharpe Ratio: {analysis['sharpe_ratio']:.2f}")
+    print(f"Annual IRR: {analysis['annual_irr']*100:.2f}%")
+    print(f"Max Drawdown: {analysis['max_drawdown']*100:.2f}%")
+    print(f"Total Investor Deposits: ${analysis['total_investor_deposits']:,.2f}")
+    
+    # Export detailed results to Excel
+    excel_file = strategy.analyzers.hi5analyzer.export_to_excel(
+        tickers=tickers,
+        start_date=start_date,
+        end_date=end_date
+    )
+    print(f"\nDetailed results exported to: {excel_file}")
+    
+    # Try to plot results
+    try:
+        cerebro.plot(style='candlestick', barup='green', bardown='red')
+    except Exception as e:
+        print(f"Note: Chart plotting failed ({str(e)}), but backtest completed successfully")
