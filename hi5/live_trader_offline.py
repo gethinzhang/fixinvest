@@ -398,7 +398,7 @@ class OfflineTradingPlanner:
                 print(
                     "Error: SMTP settings are required when email notifications are enabled"
                 )
-                print("Please provide SMTP configuration in smtp_config.json")
+                print("Please provide SMTP configuration in smtp-config.json")
                 sys.exit(1)
             self.email_manager = EmailManager(
                 smtp_server=smtp_server,
@@ -874,16 +874,17 @@ If you have any questions or need to adjust the strategy, please check the logs 
                 time.sleep(60)  # Wait a minute before retrying
 
 
-def load_smtp_config(config_file="smtp_config.json"):
+def load_smtp_config(config_file="smtp-config.json"):
     """Load SMTP configuration from JSON file"""
     try:
         if not os.path.exists(config_file):
+            print(f"Error: SMTP config file {config_file} does not exist.")
             return None
 
         with open(config_file, "r") as f:
             config = json.load(f)
 
-        required_fields = ["server", "port", "username", "password"]
+        required_fields = ["server", "port", "username", "password", "use_tls"]
         if not all(field in config for field in required_fields):
             print(f"Error: SMTP config file missing required fields: {required_fields}")
             return None
@@ -931,7 +932,7 @@ def main():
             return
     else:
         # Default: today
-        test_dates = [datetime.datetime.now()]
+        test_dates = [datetime.datetime.now() - datetime.timedelta(days=1)]
 
     # Load SMTP config if email is enabled
     smtp_config = None
@@ -939,7 +940,7 @@ def main():
         smtp_config = load_smtp_config(args.smtp_config)
         if not smtp_config:
             print(f"Error: Could not load SMTP configuration from {args.smtp_config}")
-            print("Please create a smtp_config.json file with the following format:")
+            print("Please create a smtp-config.json file with the following format:")
             print(
                 """
 {
@@ -992,7 +993,9 @@ def main():
     ORDER BY date
     """
     
+    print(f"trading_days_query: {trading_days_query}")
     trading_days_result = planner.bq_client.query(trading_days_query).result()
+    print(f"trading_days_result: {trading_days_result}")
     trading_days = [row.date for row in trading_days_result]
     
     if not trading_days:
