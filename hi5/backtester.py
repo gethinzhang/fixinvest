@@ -167,7 +167,7 @@ def main():
     parser.add_argument(
         "--start-date",
         type=str,
-        default="2000-01-01",
+        default="2010-01-01",
         help="Backtest start date (YYYY-MM-DD)",
     )
     parser.add_argument(
@@ -181,6 +181,11 @@ def main():
         type=str,
         default="gcp-config.json",
         help="Path to GCP config JSON",
+    )
+    parser.add_argument(
+        "--export-excel",
+        action="store_true",
+        help="Export results to Excel",
     )
     args = parser.parse_args()
 
@@ -217,6 +222,8 @@ def main():
     #analysis = analyzer.get_analysis()
     # analyzer.export_to_excel(start_date, end_date)
     analyzer.print_summary(final_positions=False)
+    if args.export_excel:
+        analyzer.export_to_excel()
 
 
 if __name__ == "__main__":
