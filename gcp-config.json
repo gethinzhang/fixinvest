@@ -1,0 +1,6 @@
+{
+    "project_id": "hi5-strategy",
+    "bucket_name": "hi5-andy",
+    "blob_name": "hi5-state.json",
+    "credentials_path": "credentials/gcp-credentials.json"
+} 
