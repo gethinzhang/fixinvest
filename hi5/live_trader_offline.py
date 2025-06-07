@@ -628,9 +628,9 @@ class OfflineTradingPlanner:
             """
             extreme_result = self.bq_client.query(extreme_query).result()
             for row in extreme_result:
-                if row.ema20_ratio <= 0.15:  # Human extreme condition: less than 20% above EMA20
+                if row.ma50_ratio <= 0.15:  # Human extreme condition: less than 20% above EMA20
                     reason = (
-                        f"Human extreme condition triggered: EMA20 ratio = {row.ema20_ratio:.2%}"
+                        f"Human extreme condition triggered: MA50 ratio = {row.ma50_ratio:.2%}"
                     )
                     plans.extend(self._create_trading_plans(reason, multiplier=5))  # 5x contribution
                     self.state.third_exec = True
@@ -790,6 +790,7 @@ Current state:
 - Month: {self.state.current_month}
 - First Exec: {self.state.first_exec}
 - Second Exec: {self.state.second_exec}
+- Third Exec: {self.state.third_exec}
 
 If you have any questions or need to adjust the strategy, please check the logs or contact the system administrator.
 """

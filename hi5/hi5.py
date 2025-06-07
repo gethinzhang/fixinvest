@@ -203,13 +203,13 @@ class Hi5Strategy(bt.Strategy):
         ('enable_cash_injection', True),
         ('cash_injection_threshold', 5),
         ('cash_per_contribution', 10000),
-        ('non_resident_tax_rate', 0.3),
         ('market_breadth_df', None),
+        ('state', Hi5State(storage_engine=InMemoryStorageEngine()))
     )
 
     def __init__(self):
         super().__init__()
-        self.state = Hi5State(storage_engine=InMemoryStorageEngine())
+        self.state = self.p.state
         self.data_feeds = {data._name: data for data in self.datas}
         self.benchmark_ticker = "RSP"
         self.tickers = self.p.tickers
@@ -220,7 +220,27 @@ class Hi5Strategy(bt.Strategy):
                 market_breadth_df=self.p.market_breadth_df
             )
 
+    def _check_and_process_dividends(self):
+        """Checks for and records dividend payments for all tickers."""
+        current_date = self.data.datetime.date(0)
+        for data in self.datas:
+            if data.lines.dividends[0] > 0:
+                position = self.getposition(data)
+                if position.size > 0:
+                    shares_held = position.size
+                    dividend_per_share = data.lines.dividends[0]
+                    gross_amount = shares_held * dividend_per_share
+
+                    if hasattr(self, 'analyzers') and hasattr(self.analyzers, 'hi5analyzer'):
+                        self.analyzers.hi5analyzer.add_dividend_event(
+                            date=current_date,
+                            ticker=data._name,
+                            gross_amount=gross_amount,
+                            shares_held=shares_held
+                        )
+
     def next(self):
+        self._check_and_process_dividends()
         current_date = self.data.datetime.date(0)
         
         # Check for August 1st rebalancing
@@ -275,26 +295,45 @@ class Hi5Strategy(bt.Strategy):
             self.state.save_state()
 
     def _rebalance_portfolio(self, reason):
-        """Rebalance portfolio to equal weights"""
+        """Rebalance portfolio to equal weights by only adjusting positions that deviate from target"""
         # Calculate total portfolio value
         total_value = self.broker.getvalue()
         target_per_position = total_value / len(self.tickers)
         
-        # First, sell all existing positions
+        # Calculate current positions and their values
+        current_positions = {}
         for ticker in self.tickers:
             data = self.data_feeds[ticker]
             position = self.getposition(data)
-            if position.size > 0:
-                self.close(data=data, reason=f"Rebalancing: {reason}")
+            current_value = position.size * data.close[0] if position.size > 0 else 0
+            current_positions[ticker] = {
+                'data': data,
+                'size': position.size,
+                'value': current_value,
+                'price': data.close[0]
+            }
         
-        # Then, buy new positions with equal weights
-        for ticker in self.tickers:
-            data = self.data_feeds[ticker]
-            price = data.close[0]
-            if price and price > 0:
-                shares = int(target_per_position / price)
-                if shares > 0:
-                    self.buy(data=data, size=shares, reason=f"Rebalancing: {reason}")
+        # Adjust positions that deviate from target
+        for ticker, pos in current_positions.items():
+            if not pos['price'] or pos['price'] <= 0:
+                continue
+                
+            target_value = target_per_position
+            current_value = pos['value']
+            value_diff = target_value - current_value
+            
+            # Only trade if the difference is significant (e.g., >1% of target)
+            if abs(value_diff) > target_value * 0.01:
+                if value_diff > 0:  # Need to buy more
+                    shares = int(value_diff / pos['price'])
+                    if shares > 0:
+                        order = self.buy(data=pos['data'], size=shares)
+                        order.reason = reason
+                else:  # Need to sell some
+                    shares = int(abs(value_diff) / pos['price'])
+                    if shares > 0:
+                        order = self.sell(data=pos['data'], size=shares)
+                        order.reason = reason
 
     def _execute_trades(self, reason, multiplier=1):
         total_investment = self.p.cash_per_contribution * multiplier
