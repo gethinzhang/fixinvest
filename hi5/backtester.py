@@ -69,12 +69,20 @@ def load_bigquery_data(tickers, start_date, end_date, gcp_config):
         raise RuntimeError(
             "No data returned from BigQuery for the given tickers and date range."
         )
+
+    # Create a full date range for the backtest to align all data feeds
+    full_date_range = pd.date_range(start=start_date, end=end_date, freq="D")
     data_dict = {}
     for ticker in tickers:
         tdf = df[df["ticker"] == ticker].copy()
+        if tdf.empty:
+            continue
         tdf["date"] = pd.to_datetime(tdf["date"])
         tdf.set_index("date", inplace=True)
         tdf.sort_index(inplace=True)
+
+        # Reindex to the full date range, forward-fill holidays/missing days, then backfill any leading NaNs
+        tdf = tdf.reindex(full_date_range).ffill().bfill()
 
         if "split_ratio" in tdf.columns and not tdf[tdf["split_ratio"] != 1.0].empty:
             price_adj_factor = (
@@ -124,7 +132,15 @@ def load_market_breadth(start_date, end_date, gcp_config):
 
 
 # --- Helper functions ---
-def setup_cerebro(strategy_tickers, market_breadth_df=None):
+def setup_cerebro(
+    strategy_tickers,
+    benchmark_ticker,
+    market_breadth_df=None,
+    contribution_mode="fixed",
+    monthly_increment=500.0,
+    contribution_percentage=0.2,
+    initial_contribution=10000.0,
+):
     cerebro = bt.Cerebro(stdstats=False)
     storage_engine = InMemoryStorageEngine()
     hi5_state = Hi5State(storage_engine=storage_engine)
@@ -134,17 +150,21 @@ def setup_cerebro(strategy_tickers, market_breadth_df=None):
         Hi5Strategy,
         state=hi5_state,
         tickers=strategy_tickers,
+        benchmark_ticker=benchmark_ticker,
         enable_cash_injection=True,
         cash_injection_threshold=5,
-        cash_per_contribution=10000,
+        cash_per_contribution=initial_contribution,
         market_breadth_df=market_breadth_df,
+        contribution_mode=contribution_mode,
+        monthly_increment=monthly_increment,
+        contribution_percentage=contribution_percentage,
     )
 
     cerebro.addanalyzer(
         BacktestAnalyzer,
         _name="hi5analyzer",
         risk_free_rate=0.04,
-        non_resident_tax_rate=0.1,
+        non_resident_tax_rate=0.15,
         fix_investment=True,
     )
     return cerebro
@@ -155,7 +175,8 @@ def main():
     parser.add_argument(
         "--tickers",
         type=str,
-        default="VUG,VO,MOAT,PFF,VNQ",
+        #default="VUG,VO,MOAT,PFF,VNQ",
+        default="VUG,VO,MOAT,PFFD,IDWP.L",
         help="Comma-separated list of tickers",
     )
     parser.add_argument(
@@ -183,9 +204,35 @@ def main():
         help="Path to GCP config JSON",
     )
     parser.add_argument(
-        "--export-excel",
+        "--show-drawdown-history",
         action="store_true",
-        help="Export results to Excel",
+        help="Show portfolio values during the maximum drawdown period.",
+    )
+    # New arguments for contribution logic
+    parser.add_argument(
+        "--contribution-mode",
+        type=str,
+        default="fixed",
+        choices=["fixed", "incremental", "percentage"],
+        help="Contribution strategy: fixed amount, incremental, or percentage of portfolio.",
+    )
+    parser.add_argument(
+        "--monthly-increment",
+        type=float,
+        default=500.0,
+        help="The amount to increment the contribution by each month in 'incremental' mode.",
+    )
+    parser.add_argument(
+        "--contribution-percentage",
+        type=float,
+        default=0.01,
+        help="The portfolio percentage to contribute in 'percentage' mode (e.g., 0.01 for 1%).",
+    )
+    parser.add_argument(
+        "--initial-contribution",
+        type=float,
+        default=10000.0,
+        help="The initial contribution amount for 'fixed' and 'incremental' modes.",
     )
     args = parser.parse_args()
 
@@ -211,19 +258,26 @@ def main():
 
     market_breadth_df = load_market_breadth(start_date, end_date, gcp_config)
     data_df = load_bigquery_data(all_tickers, start_date, end_date, gcp_config)
-    cerebro = setup_cerebro(all_tickers, market_breadth_df)
+    cerebro = setup_cerebro(
+        tickers,
+        benchmark_ticker,
+        market_breadth_df,
+        contribution_mode=args.contribution_mode,
+        monthly_increment=args.monthly_increment,
+        contribution_percentage=args.contribution_percentage,
+        initial_contribution=args.initial_contribution,
+    )
     add_data_feeds(cerebro, all_tickers, data_df)
 
-    cerebro.broker.setcash(1000000)
+    cerebro.broker.setcash(1.0)
     cerebro.broker.setcommission(commission=0.003)
     results = cerebro.run()
     hi5_strategy = results[0]
     analyzer = hi5_strategy.analyzers.hi5analyzer
-    #analysis = analyzer.get_analysis()
-    # analyzer.export_to_excel(start_date, end_date)
-    analyzer.print_summary(final_positions=False)
-    if args.export_excel:
-        analyzer.export_to_excel()
+
+
+    analyzer.print_summary(print_drawdown_history=args.show_drawdown_history)
+    analyzer.export_to_excel()
 
 
 if __name__ == "__main__":

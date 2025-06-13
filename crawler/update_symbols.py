@@ -183,12 +183,12 @@ def main():
     parser = argparse.ArgumentParser(description="Symbols Updater")
     parser.add_argument(
         "--credentials",
-        required=True,
+        default="credentials/gcp-credentials.json",
         help="Path to GCP service account credentials JSON file"
     )
     parser.add_argument(
         "--project-id",
-        required=True,
+        default="hi5-strategy",
         help="GCP project ID"
     )
     parser.add_argument(

@@ -5,7 +5,6 @@ import json
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 import pandas as pd
-import yfinance as yf
 import pytz
 import smtplib
 from email.mime.text import MIMEText
@@ -16,6 +15,9 @@ import icalendar
 import sys
 from google.cloud import bigquery
 from google.oauth2 import service_account
+from googleapiclient.discovery import build
+import argparse
+
 
 # Import our strategy components
 from hi5.hi5 import Hi5State, InMemoryStorageEngine, LocalStorageEngine
@@ -47,247 +49,41 @@ class EmailManager:
         self.smtp_username = smtp_username
         self.smtp_password = smtp_password
 
-    def create_calendar_invitation(self, plan: TradingPlan) -> bytes:
-        """Create an ICS file for the trading plan"""
-        cal = icalendar.Calendar()
-        cal.add('prodid', '-//Hi5 Trading Plan//EN')
-        cal.add('version', '2.0')
-        cal.add('method', 'REQUEST')  # Add method REQUEST for calendar invitations
-
-        # Create event
-        event = icalendar.Event()
-        event.add('summary', f'Hi5 Trade: {plan.action} {plan.shares} {plan.ticker}')
-        #event.add('status', 'CONFIRMED')  # Add status
-        #event.add('transp', 'OPAQUE')  # Add transparency
-        #event.add('sequence', 0)  # Add sequence number
-
-        # Set time to 8:30 AM ET on next trading day
-        et_tz = pytz.timezone('America/New_York')
-        event_date = plan.date
-        while event_date.weekday() >= 5:  # Skip weekends
-            event_date += datetime.timedelta(days=1)
-        
-        start_time = et_tz.localize(
-            datetime.datetime.combine(event_date.date(), datetime.time(8, 30))
-        )
-
-        end_time = start_time + datetime.timedelta(minutes=30)
-
-        event.add('dtstart', start_time)
-        event.add('dtend', end_time)
-        event.add('dtstamp', datetime.datetime.now(pytz.UTC))  # Add timezone
-        event.add('created', datetime.datetime.now(pytz.UTC))  # Add creation time
-        event.add('last-modified', datetime.datetime.now(pytz.UTC))  # Add last modified
-
-        # Add organizer
-        event.add('organizer', f'MAILTO:{self.smtp_username}')
-        event.add('attendee', f'MAILTO:{self.smtp_username}')
-
-        # Add alarm/reminder 30 minutes before
-        alarm = icalendar.Alarm()
-        alarm.add('action', 'DISPLAY')
-        alarm.add('description', f'Reminder: Hi5 Trade {plan.action} {plan.shares} {plan.ticker}')
-        alarm.add('trigger', datetime.timedelta(minutes=-30))
-        event.add_component(alarm)
-
-        # Add description
-        description = f"""Hi5 Trading Plan
-
-Action: {plan.action}
-Ticker: {plan.ticker}
-Shares: {plan.shares}
-Current Price: ${plan.current_price:.2f}
-Target Value: ${plan.target_value:.2f}
-Reason: {plan.reason}
-
-Execution Notes:
-{plan.execution_notes}
-
-Pre-Trade Checklist:
-□ Check pre-market movement
-□ Verify no pending news/earnings
-□ Confirm market conditions align
-□ Set limit order if high volatility
-□ Document actual execution price
-
-Remember: This is a plan, not a commitment. Adjust based on market conditions.
-"""
-        event.add('description', description)
-
-        # Add to calendar
-        cal.add_component(event)
-
-        return cal.to_ical()
-
-    def send_calendar_invitation(self, recipient_email: str, plan: TradingPlan):
-        """Send calendar invitation via email"""
-        try:
-            # Create message
-            msg = MIMEMultipart('mixed')
-            msg['Subject'] = f'Hi5 Trading Plan: {plan.action} {plan.ticker}'
-            msg['From'] = self.smtp_username
-            msg['To'] = recipient_email
-
-            # Add text body
-            body = f"""Hi5 Trading Plan
-
-Action: {plan.action}
-Ticker: {plan.ticker}
-Shares: {plan.shares}
-Current Price: ${plan.current_price:.2f}
-Target Value: ${plan.target_value:.2f}
-Reason: {plan.reason}
-
-Execution Notes:
-{plan.execution_notes}
-
-Pre-Trade Checklist:
-□ Check pre-market movement
-□ Verify no pending news/earnings
-□ Confirm market conditions align
-□ Set limit order if high volatility
-□ Document actual execution price
-
-Remember: This is a plan, not a commitment. Adjust based on market conditions.
-"""
-            msg.attach(MIMEText(body, 'plain'))
-
-            # Add calendar invitation
-            ics_data = self.create_calendar_invitation(plan)
-            part = MIMEBase('text', 'calendar', method='REQUEST')
-            part.set_payload(ics_data)
-            encoders.encode_base64(part)
-            part.add_header('Content-Type', 'text/calendar; method=REQUEST; charset=UTF-8')
-            part.add_header('Content-Disposition', 'attachment; filename=invite.ics')
-            msg.attach(part)
-
-            # Send email
-            with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
-                server.starttls()
-                server.login(self.smtp_username, self.smtp_password)
-                server.send_message(msg)
-
-            print(f"Calendar invitation sent to {recipient_email}")
-            return True
-
-        except Exception as e:
-            print(f"Error sending calendar invitation: {e}")
-            return False
-
-    def send_plan_summary_email(self, recipient_email: str, plans: List[TradingPlan]):
-        """Send email summary of trading plans"""
-        try:
-            # Create message
-            msg = MIMEMultipart("alternative")
-            msg["Subject"] = (
-                f"Hi5 Trading Plan - {datetime.datetime.now().strftime('%Y-%m-%d')}"
-            )
-            msg["From"] = self.smtp_username
-            msg["To"] = recipient_email
-
-            # Build HTML body
-            total_investment = sum(p.target_value for p in plans)
-
-            body = f"""
-            <html>
-                <body>
-                    <h2>Hi5 Trading Plan Summary</h2>
-                    <p><strong>Date:</strong> {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-                    <p><strong>Total Investment:</strong> ${total_investment:,.2f}</p>
-                    <hr>
-                    <h3>Planned Trades:</h3>
-                    <table border="1" cellpadding="5" cellspacing="0">
-                        <tr>
-                            <th>Ticker</th>
-                            <th>Action</th>
-                            <th>Shares</th>
-                            <th>Price</th>
-                            <th>Value</th>
-                            <th>Reason</th>
-                        </tr>
-            """
-
-            for plan in plans:
-                body += f"""
-                        <tr>
-                            <td>{plan.ticker}</td>
-                            <td>{plan.action}</td>
-                            <td>{plan.shares}</td>
-                            <td>${plan.current_price:.2f}</td>
-                            <td>${plan.target_value:.2f}</td>
-                            <td>{plan.reason}</td>
-                        </tr>
-                """
-
-            body += """
-                    </table>
-                    <hr>
-                    <p><strong>Next Steps:</strong></p>
-                    <ol>
-                        <li>Check your calendar for trade reminders</li>
-                        <li>Execute trades during market hours</li>
-                        <li>Update tracking spreadsheet after execution</li>
-                    </ol>
-                    <p style="color: red;"><strong>Remember:</strong> This is a plan, not a commitment. Adjust based on market conditions.</p>
-                </body>
-            </html>
-            """
-
-            html_part = MIMEText(body, "html")
-            msg.attach(html_part)
-
-            # Send email
-            with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
-                server.starttls()
-                server.login(self.smtp_username, self.smtp_password)
-                server.send_message(msg)
-
-            print(f"Plan summary email sent to {recipient_email}")
-            return True
-
-        except Exception as e:
-            print(f"Error sending email: {e}")
-            return False
-
     def create_daily_calendar_invitation(
         self, plans: List[TradingPlan], trading_day: datetime.datetime
     ) -> bytes:
         """Create an ICS file for all trading plans for a day"""
         cal = icalendar.Calendar()
-        cal.add('prodid', '-//Hi5 Trading Plan//EN')
-        cal.add('version', '2.0')
-        cal.add('method', 'REQUEST')  # Add method REQUEST for calendar invitations
+        cal.add("prodid", "-//Hi5 Trading Plan//EN")
+        cal.add("version", "2.0")
+        cal.add("method", "REQUEST")
 
         event = icalendar.Event()
-        event.add('summary', f'Hi5 Trading Plan for {trading_day.strftime("%Y-%m-%d")}')
-        #event.add('status', 'CONFIRMED')  # Add status
-        #event.add('transp', 'OPAQUE')  # Add transparency
-        #event.add('sequence', 0)  # Add sequence number
+        event.add("summary", f'Hi5 Trading Plan for {trading_day.strftime("%Y-%m-%d")}')
 
-        et_tz = pytz.timezone('America/New_York')
-        # Set time to 8:30 AM ET
+        et_tz = pytz.timezone("America/New_York")
         start_time = et_tz.localize(
             datetime.datetime.combine(trading_day.date(), datetime.time(8, 30))
         )
         end_time = start_time + datetime.timedelta(minutes=30)
-        event.add('dtstart', start_time)
-        event.add('dtend', end_time)
-        event.add('dtstamp', datetime.datetime.now(pytz.UTC))  # Add timezone
-        event.add('created', datetime.datetime.now(pytz.UTC))  # Add creation time
-        event.add('last-modified', datetime.datetime.now(pytz.UTC))  # Add last modified
 
-        # Add organizer
-        event.add('organizer', f'MAILTO:{self.smtp_username}')
-        event.add('attendee', f'MAILTO:{self.smtp_username}')
+        event.add("dtstart", start_time)
+        event.add("dtend", end_time)
+        event.add("dtstamp", datetime.datetime.now(pytz.UTC))
+        event.add("created", datetime.datetime.now(pytz.UTC))
+        event.add("last-modified", datetime.datetime.now(pytz.UTC))
+        event.add("organizer", f"MAILTO:{self.smtp_username}")
+        event.add("attendee", f"MAILTO:{self.smtp_username}")
 
-        # Add alarm/reminder 30 minutes before
         alarm = icalendar.Alarm()
-        alarm.add('action', 'DISPLAY')
-        alarm.add('description', f'Reminder: Hi5 Trading Plan for {trading_day.strftime("%Y-%m-%d")}')
-        alarm.add('trigger', datetime.timedelta(minutes=-30))
+        alarm.add("action", "DISPLAY")
+        alarm.add(
+            "description",
+            f'Reminder: Hi5 Trading Plan for {trading_day.strftime("%Y-%m-%d")}',
+        )
+        alarm.add("trigger", datetime.timedelta(minutes=-30))
         event.add_component(alarm)
 
-        # Build description
         description = "Hi5 Trading Plan\n\n"
         for plan in plans:
             description += f"{plan.action} {plan.shares} {plan.ticker} @ ${plan.current_price:.2f} (Reason: {plan.reason})\n"
@@ -299,7 +95,7 @@ Remember: This is a plan, not a commitment. Adjust based on market conditions.
             "□ Set limit order if high volatility\n"
             "□ Document actual execution price\n"
         )
-        event.add('description', description)
+        event.add("description", description)
         cal.add_component(event)
         return cal.to_ical()
 
@@ -310,52 +106,142 @@ Remember: This is a plan, not a commitment. Adjust based on market conditions.
         trading_day: datetime.datetime,
         html_summary: str,
     ):
-        """Send a single calendar invitation for all trades on a day, with HTML summary as the main body"""
+        """Send a single calendar invitation for all trades on a day."""
         try:
-            msg = MIMEMultipart('mixed')
-            msg['Subject'] = f'Hi5 Trading Plan: {trading_day.strftime("%Y-%m-%d")}'
-            msg['From'] = self.smtp_username
-            msg['To'] = recipient_email
+            msg = MIMEMultipart("mixed")
+            msg["Subject"] = f'Hi5 Trading Plan: {trading_day.strftime("%Y-%m-%d")}'
+            msg["From"] = self.smtp_username
+            msg["To"] = recipient_email
 
-            # Add HTML summary as the main body
-            msg.attach(MIMEText(html_summary, 'html'))
+            msg.attach(MIMEText(html_summary, "html"))
 
-            # Add calendar invitation
             ics_data = self.create_daily_calendar_invitation(plans, trading_day)
-            part = MIMEBase('text', 'calendar', method='REQUEST')
+            part = MIMEBase("text", "calendar", method="REQUEST")
             part.set_payload(ics_data)
             encoders.encode_base64(part)
-            part.add_header('Content-Type', 'text/calendar; method=REQUEST; charset=UTF-8')
-            part.add_header('Content-Disposition', 'attachment; filename=invite.ics')
+            part.add_header(
+                "Content-Type", "text/calendar; method=REQUEST; charset=UTF-8"
+            )
+            part.add_header("Content-Disposition", "attachment; filename=invite.ics")
             msg.attach(part)
 
-            # Send email
             with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
                 server.starttls()
                 server.login(self.smtp_username, self.smtp_password)
                 server.send_message(msg)
 
-            print(f"Daily calendar invitation (with summary) sent to {recipient_email}")
-            return True
+            print(f"Daily calendar invitation sent to {recipient_email}")
         except Exception as e:
             print(f"Error sending daily calendar invitation: {e}")
-            return False
 
 
-def parse_test_dates(test_date_arg):
-    """Parse --test-date argument, supporting single date or range."""
-    if not test_date_arg:
-        return None
-    if ":" in test_date_arg:
-        start_str, end_str = test_date_arg.split(":", 1)
-        start_date = datetime.datetime.strptime(start_str, "%Y-%m-%d")
-        end_date = datetime.datetime.strptime(end_str, "%Y-%m-%d")
-        if end_date < start_date:
-            raise ValueError("End date must not be before start date")
-        num_days = (end_date - start_date).days + 1
-        return [start_date + datetime.timedelta(days=i) for i in range(num_days)]
-    else:
-        return [datetime.datetime.strptime(test_date_arg, "%Y-%m-%d")]
+class GoogleDocsManager:
+    """Manages writing data to a Google Doc."""
+
+    def __init__(self, credentials_path: str, document_id: str):
+        self.document_id = document_id
+        try:
+            scopes = ["https://www.googleapis.com/auth/documents"]
+            creds = service_account.Credentials.from_service_account_file(
+                credentials_path, scopes=scopes
+            )
+            self.service = build("docs", "v1", credentials=creds)
+        except Exception as e:
+            print(f"Error initializing Google Docs client: {e}")
+            raise
+
+    def clear_document_body(self):
+        """Deletes all content from the document body."""
+        try:
+            # Get the document to find the end index of the body content
+            document = (
+                self.service.documents().get(documentId=self.document_id).execute()
+            )
+            content = document.get("body").get("content")
+
+            # Find the total length of the content in the body.
+            # We need to leave the first character to avoid deleting the body segment.
+            end_index = 1
+            if len(content) > 1:
+                for element in content:
+                    if "endIndex" in element:
+                        end_index = max(end_index, element["endIndex"])
+
+            if end_index > 2:  # Only delete if there is content
+                requests = [
+                    {
+                        "deleteContentRange": {
+                            "range": {
+                                "startIndex": 1,
+                                "endIndex": end_index
+                                - 1,  # Delete up to the last character
+                            }
+                        }
+                    }
+                ]
+                self.service.documents().batchUpdate(
+                    documentId=self.document_id, body={"requests": requests}
+                ).execute()
+        except Exception as e:
+            print(f"Error clearing Google Doc: {e}")
+
+    def update_doc(
+        self,
+        portfolio_summary: dict,
+        orders_df: pd.DataFrame,
+        dividends_df: pd.DataFrame,
+        irr: float,
+    ):
+        """Updates the Google Doc with the latest portfolio status, orders, and dividends."""
+        self.clear_document_body()
+
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Build the text content
+        content = f"Hi5 Portfolio Status - Last Updated: {now_str}\n\n"
+        content += "--- Portfolio Summary ---\n"
+        for key, value in portfolio_summary.items():
+            try:  # Try to format as currency
+                content += f"{key}: ${float(value):,.2f}\n"
+            except (ValueError, TypeError):
+                content += f"{key}: {value}\n"
+        content += f"Estimated IRR: {irr:.2%}\n\n"
+
+        content += "--- Recent Orders ---\n"
+        content += (
+            orders_df.to_string(index=False)
+            if not orders_df.empty
+            else "No recent orders.\n"
+        )
+        content += "\n\n"
+
+        content += "--- Recent Dividends ---\n"
+        content += (
+            dividends_df.to_string(index=False)
+            if not dividends_df.empty
+            else "No recent dividends.\n"
+        )
+
+        requests = [
+            {
+                "insertText": {
+                    "location": {
+                        "index": 1,
+                    },
+                    "text": content,
+                }
+            }
+        ]
+
+        try:
+            self.service.documents().batchUpdate(
+                documentId=self.document_id, body={"requests": requests}
+            ).execute()
+            print(
+                f"Successfully updated Google Doc: https://docs.google.com/document/d/{self.document_id}/edit"
+            )
+        except Exception as e:
+            print(f"Error updating Google Doc: {e}")
 
 
 class OfflineTradingPlanner:
@@ -368,30 +254,40 @@ class OfflineTradingPlanner:
         smtp_port=None,
         smtp_username=None,
         smtp_password=None,
-        test_date=None,
+        test_dates=None,
         engine="local",
         bucket_name=None,
         blob_name=None,
         credentials_path=None,
         project_id=None,
+        gdocs_document_id=None,
     ):
         self.recipient_email = recipient_email
-        # test_date can be None, a list of datetimes, or a single datetime
-        if test_date is None:
-            self.test_dates = None
-        elif isinstance(test_date, list):
-            self.test_dates = test_date
-        else:
-            self.test_dates = [test_date]
+        self.test_dates = (
+            test_dates
+            if test_dates
+            else [datetime.datetime.now() - datetime.timedelta(days=1)]
+        )
         self.engine = engine
         self.project_id = project_id
-        
+
+        self.gdocs_manager = None
+        if gdocs_document_id and credentials_path:
+            print(
+                f"Google Docs integration enabled for document ID: {gdocs_document_id}"
+            )
+            self.gdocs_manager = GoogleDocsManager(
+                credentials_path=credentials_path, document_id=gdocs_document_id
+            )
+
         # Initialize BigQuery client
         if not credentials_path or not project_id:
             raise ValueError("credentials_path and project_id are required")
-        credentials = service_account.Credentials.from_service_account_file(credentials_path)
+        credentials = service_account.Credentials.from_service_account_file(
+            credentials_path
+        )
         self.bq_client = bigquery.Client(credentials=credentials, project=project_id)
-        
+
         # Email services
         if recipient_email:
             if not all([smtp_server, smtp_port, smtp_username, smtp_password]):
@@ -408,6 +304,7 @@ class OfflineTradingPlanner:
             )
         else:
             self.email_manager = None
+
         # Strategy setup: choose storage engine
         if engine == "local":
             storage_engine = LocalStorageEngine("./hi5_offline_state.json")
@@ -427,33 +324,45 @@ class OfflineTradingPlanner:
         else:
             raise ValueError(f"Unknown engine: {engine}")
         self.state = Hi5State(storage_engine=storage_engine)
-        # Trading parameters (from Hi5Strategy)
-        self.tickers = ["VUG", "VO", "MOAT", "PFF", "VNQ"]
+        # Trading parameters
+        self.tickers = ["VUG", "VO", "MOAT", "PFFD", "IDWP.L"]
         self.benchmark_ticker = "RSP"
         self.cash_per_contribution = 10000
-        self.non_resident_tax_rate = 0.3
-        # Market data cache
         self.price_cache = {}
 
-    def _get_market_data_from_bigquery(self, trading_day: datetime.datetime) -> pd.DataFrame:
-        """Fetch market data from BigQuery for the given trading day"""
-        query = f"""
+    def get_investment_amount(self, portfolio_value: float) -> float:
+        """Determines the investment amount based on portfolio value."""
+        if portfolio_value > 500000:
+            print("Using percentage-based investment strategy (1% of portfolio value)")
+            return portfolio_value * 0.01
+        else:
+            print(
+                f"Using incremental investment strategy (base: ${self.cash_per_contribution:,.2f})"
+            )
+            return self.cash_per_contribution
+
+    def update_market_data(self, trading_day):
+        """Fetch market data from BigQuery for the given trading day."""
+        all_tickers = self.tickers + [self.benchmark_ticker]
+        self.price_cache = {}
+
+        current_query = f"""
         WITH prev_day AS (
             SELECT 
                 ticker,
                 date,
-                close,
-                LAG(close) OVER (PARTITION BY ticker ORDER BY date) as prev_close
+                adj_close,
+                LAG(adj_close) OVER (PARTITION BY ticker ORDER BY date) as prev_adj_close
             FROM `{self.project_id}.market_data.marketing`
             WHERE date <= DATE('{trading_day.strftime('%Y-%m-%d')}')
         )
         SELECT 
             ticker,
             date,
-            close,
-            prev_close,
-            (close - prev_close) as change,
-            ((close - prev_close) / prev_close * 100) as change_percent
+            adj_close as close,
+            prev_adj_close as prev_close,
+            (adj_close - prev_adj_close) as change,
+            ((adj_close - prev_adj_close) / prev_adj_close * 100) as change_percent
         FROM prev_day
         WHERE date = DATE('{trading_day.strftime('%Y-%m-%d')}')
         AND ticker IN UNNEST(@tickers)
@@ -461,106 +370,62 @@ class OfflineTradingPlanner:
         
         job_config = bigquery.QueryJobConfig(
             query_parameters=[
-                bigquery.ArrayQueryParameter("tickers", "STRING", self.tickers + [self.benchmark_ticker])
+                bigquery.ArrayQueryParameter("tickers", "STRING", all_tickers)
             ]
         )
         
-        query_job = self.bq_client.query(query, job_config=job_config)
-        results = query_job.result()
-        
-        # Convert to DataFrame and ensure correct types
-        df = results.to_dataframe()
+        query_job = self.bq_client.query(current_query, job_config=job_config)
+        df = query_job.result().to_dataframe()
+
         if df.empty:
+            print("BigQuery query (for debugging):\n" + current_query)
             raise RuntimeError(f"No data found in BigQuery for {trading_day.strftime('%Y-%m-%d')}")
         
-        # Create a new DataFrame with only essential columns and proper types
-        clean_df = pd.DataFrame({
-            'ticker': df['ticker'].astype(str),
-            'date': pd.to_datetime(df['date']).dt.date,
-            'close': df['close'].astype(float),
-            'prev_close': df['prev_close'].astype(float),
-            'change': df['change'].astype(float),
-            'change_percent': df['change_percent'].astype(float)
-        })
-            
-        return clean_df
+        for _, row in df.iterrows():
+            ticker = row["ticker"]
+            self.price_cache[ticker] = {
+                "current": row["close"],
+                "previous_close": row["prev_close"],
+                "change": row["change"],
+                "change_percent": row["change_percent"],
+            }
 
-    def update_market_data(self, trading_day, preloaded_data=None):
-        """
-        Fetch market data from BigQuery for the previous trading day.
-        """
-        all_tickers = self.tickers + [self.benchmark_ticker]
-        self.price_cache = {}
+        missing_tickers = [t for t in all_tickers if t not in self.price_cache]
+        if missing_tickers:
+            print("BigQuery query (for debugging):\n" + current_query)
+            raise RuntimeError(f"Missing data for tickers: {missing_tickers} on {trading_day.strftime('%Y-%m-%d')}")
 
-        try:
-            # Get current day data
-            current_query = f"""
-            WITH prev_day AS (
-                SELECT 
-                    ticker,
-                    date,
-                    adj_close,
-                    LAG(adj_close) OVER (PARTITION BY ticker ORDER BY date) as prev_adj_close
-                FROM `{self.project_id}.market_data.marketing`
-                WHERE date <= DATE('{trading_day.strftime('%Y-%m-%d')}')
-            )
-            SELECT 
-                ticker,
-                date,
-                adj_close as close,
-                prev_adj_close as prev_close,
-                (adj_close - prev_adj_close) as change,
-                ((adj_close - prev_adj_close) / prev_adj_close * 100) as change_percent
-            FROM prev_day
-            WHERE date = DATE('{trading_day.strftime('%Y-%m-%d')}')
-            AND ticker IN UNNEST(@tickers)
-            """
-            
-            job_config = bigquery.QueryJobConfig(
-                query_parameters=[
-                    bigquery.ArrayQueryParameter("tickers", "STRING", all_tickers)
-                ]
-            )
-            
-            query_job = self.bq_client.query(current_query, job_config=job_config)
-            results = query_job.result()
-            
-            # Convert to DataFrame and ensure correct types
-            df = results.to_dataframe()
-            if df.empty:
-                raise RuntimeError(f"No data found in BigQuery for {trading_day.strftime('%Y-%m-%d')}")
-            
-            for _, row in df.iterrows():
-                ticker = row['ticker']
-                self.price_cache[ticker] = {
-                    "current": row['close'],
-                    "previous_close": row['prev_close'],
-                    "change": row['change'],
-                    "change_percent": row['change_percent'],
-                }
-                #print(
-                #    f"{ticker}: ${row['close']:.2f} (Prev: ${row['prev_close']:.2f}, {row['change_percent']:+.2f}%)"
-                #)
-
-        except Exception as e:
-            print(f"Error fetching data from BigQuery: {e}")
-            raise
-
-    def check_hi5_signals(self, trading_day, preloaded_data=None) -> List[TradingPlan]:
-        """Check Hi5 strategy for trading signals"""
+    def check_hi5_signals(self, trading_day) -> Tuple[List[TradingPlan], dict]:
+        """Check Hi5 strategy for trading signals."""
         plans = []
-        self.update_market_data(trading_day, preloaded_data=preloaded_data)
+        self.update_market_data(trading_day)
 
-        # Get RSP data for strategy logic
-        rsp_data = self.price_cache.get(self.benchmark_ticker, {})
-        rsp_price = rsp_data.get("current", 0)
-        rsp_prev_close = rsp_data.get("previous_close", rsp_price)
+        # Always fail if price data is missing or invalid
+        rsp_data = self.price_cache.get(self.benchmark_ticker)
+        if not rsp_data or rsp_data.get("current") is None:
+            raise RuntimeError(f"Missing or invalid RSP price data for {trading_day.strftime('%Y-%m-%d')}: {rsp_data}")
+        rsp_price = rsp_data["current"]
+        rsp_prev_close = rsp_data["previous_close"]
+        if rsp_price is None or rsp_prev_close is None:
+            raise RuntimeError(f"Missing RSP price or previous close for {trading_day.strftime('%Y-%m-%d')}: {rsp_data}")
 
-        if not rsp_price:
-            print("Warning: Could not get RSP price")
-            return plans
+        portfolio_value = self.get_investment_amount(0)
+        print(f"Current portfolio value for target tickers: ${portfolio_value:,.2f}")
 
-        # Month refresh logic
+        base_investment_amount = self.get_investment_amount(portfolio_value)
+
+        trigger_context = {
+            "rsp_price": rsp_price,
+            "rsp_daily_return": (
+                (rsp_price / rsp_prev_close - 1) if rsp_prev_close else 0
+            ),
+            "rsp_mtd_return": None,
+            "ma50_ratio": None,
+            "first_exec_triggered": False,
+            "second_exec_triggered": False,
+            "third_exec_triggered": False,
+        }
+
         if (
             self.state.current_month is None
             or self.state.current_month != trading_day.month
@@ -572,23 +437,24 @@ class OfflineTradingPlanner:
             self.state.save_state()
             print(f"Month refreshed: {trading_day.month}")
 
-        # Check for buy signals
-        # 1. First monthly investment
         if not self.state.first_exec:
-            daily_return = (rsp_price / rsp_prev_close - 1) if rsp_prev_close else 0
+            daily_return = trigger_context["rsp_daily_return"]
             if daily_return <= -0.01:
-                reason = (
-                    f"RSP daily drop <= -1%: Current ${rsp_price:.2f}, Daily change {daily_return*100:+.2f}%"
-                )
-                plans.extend(self._create_trading_plans(reason))
+                reason = f"RSP daily drop <= -1%: Current ${rsp_price:.2f}, Daily change {daily_return*100:+.2f}%"
+                multiplier = 2 if portfolio_value < 500000 else 1
+                investment_amount = base_investment_amount * multiplier
+                plans.extend(self._create_trading_plans(reason, investment_amount))
                 self.state.first_exec = True
+                trigger_context["first_exec_triggered"] = True
             elif self._is_third_week_end():
-                plans.extend(self._create_trading_plans("Third week end"))
+                reason = "Third week end"
+                multiplier = 2 if portfolio_value < 500000 else 1
+                investment_amount = base_investment_amount * multiplier
+                plans.extend(self._create_trading_plans(reason, investment_amount))
                 self.state.first_exec = True
+                trigger_context["first_exec_triggered"] = True
 
-        # 2. Second investment on larger drop
         if not self.state.second_exec:
-            # Get the first trading day of the month for MTD calculation
             query = f"""
             SELECT MIN(date) as first_date
             FROM `{self.project_id}.market_data.marketing`
@@ -596,10 +462,9 @@ class OfflineTradingPlanner:
             AND ticker = '{self.benchmark_ticker}'
             """
             result = self.bq_client.query(query).result()
-            first_date = next(result).first_date
-            
-            if first_date:
-                # Get the price for the first date
+            first_date_row = next(result, None)
+            if first_date_row and first_date_row.first_date:
+                first_date = first_date_row.first_date
                 price_query = f"""
                 SELECT adj_close
                 FROM `{self.project_id}.market_data.marketing`
@@ -607,19 +472,24 @@ class OfflineTradingPlanner:
                 AND ticker = '{self.benchmark_ticker}'
                 """
                 price_result = self.bq_client.query(price_query).result()
-                price_row = next(price_result)
-                month_start_price = price_row.adj_close
-                
-                mtd_return = (rsp_price / month_start_price) - 1
-                if mtd_return <= -0.05:
-                    reason = (
-                        f"RSP MTD drop <= -5%: Month start ${month_start_price:.2f} (on {first_date}), "
-                        f"Current ${rsp_price:.2f}, MTD change {mtd_return*100:+.2f}%"
-                    )
-                    plans.extend(self._create_trading_plans(reason, multiplier=3))
-                    self.state.second_exec = True
+                price_row = next(price_result, None)
+                if price_row:
+                    month_start_price = price_row.adj_close
+                    mtd_return = (rsp_price / month_start_price) - 1
+                    trigger_context["rsp_mtd_return"] = mtd_return
+                    if mtd_return <= -0.05:
+                        multiplier = 3 if portfolio_value < 500000 else 1
+                        investment_amount = base_investment_amount * multiplier
+                        reason = f"RSP MTD drop <= -5% ({mtd_return:.2%})."
+                        print(
+                            f"TRIGGER: {reason}. Investing ${investment_amount:,.2f}."
+                        )
+                        plans.extend(
+                            self._create_trading_plans(reason, investment_amount)
+                        )
+                        self.state.second_exec = True
+                        trigger_context["second_exec_triggered"] = True
 
-        # 3. Human extreme condition
         if not self.state.third_exec:
             extreme_query = f"""
             SELECT ma50_ratio
@@ -628,27 +498,29 @@ class OfflineTradingPlanner:
             """
             extreme_result = self.bq_client.query(extreme_query).result()
             for row in extreme_result:
-                if row.ma50_ratio <= 0.15:  # Human extreme condition: less than 20% above EMA20
-                    reason = (
-                        f"Human extreme condition triggered: MA50 ratio = {row.ma50_ratio:.2%}"
-                    )
-                    plans.extend(self._create_trading_plans(reason, multiplier=5))  # 5x contribution
+                trigger_context["ma50_ratio"] = row.ma50_ratio
+                if row.ma50_ratio <= 0.15:
+                    reason = f"Human extreme condition triggered: MA50 ratio = {row.ma50_ratio:.2%}"
+                    multiplier = 5 if portfolio_value < 500000 else 1
+                    investment_amount = base_investment_amount * multiplier
+                    plans.extend(self._create_trading_plans(reason, investment_amount))
                     self.state.third_exec = True
+                    trigger_context["third_exec_triggered"] = True
 
-        # Save state after checking
         if plans:
             self.state.save_state()
-            print(f"Current State: First={self.state.first_exec}, Second={self.state.second_exec}, Third={self.state.third_exec}")
+            print(
+                f"Current State: First={self.state.first_exec}, Second={self.state.second_exec}, Third={self.state.third_exec}"
+            )
 
-        return plans
+        return plans, trigger_context
 
     def _create_trading_plans(
-        self, reason: str, multiplier: int = 1
+        self, reason: str, investment_amount: float
     ) -> List[TradingPlan]:
-        """Create trading plans for all tickers"""
+        """Create trading plans for all tickers."""
         plans = []
-        total_investment = self.cash_per_contribution * multiplier
-        investment_per_ticker = total_investment / len(self.tickers)
+        investment_per_ticker = investment_amount / len(self.tickers)
 
         for ticker in self.tickers:
             ticker_data = self.price_cache.get(ticker, {})
@@ -657,9 +529,7 @@ class OfflineTradingPlanner:
             if price and price > 0:
                 shares = int(investment_per_ticker / price)
                 if shares > 0:
-                    # Add execution notes based on ticker characteristics
                     notes = self._generate_execution_notes(ticker, ticker_data)
-
                     plan = TradingPlan(
                         date=datetime.datetime.now(),
                         ticker=ticker,
@@ -671,25 +541,20 @@ class OfflineTradingPlanner:
                         execution_notes=notes,
                     )
                     plans.append(plan)
-
         return plans
 
     def _generate_execution_notes(self, ticker: str, ticker_data: dict) -> str:
-        """Generate execution notes based on ticker and market conditions"""
+        """Generate execution notes based on ticker and market conditions."""
         notes = []
-
         change_pct = ticker_data.get("change_percent", 0)
 
-        # Add notes based on price movement
         if abs(change_pct) > 2:
             notes.append(f"High volatility today ({change_pct:+.1f}%)")
             notes.append("Consider using limit order")
-
         if change_pct < -1:
             notes.append("Already down today - may see further decline")
             notes.append("Consider splitting order throughout the day")
 
-        # Ticker-specific notes
         ticker_notes = {
             "VUG": "Growth ETF - check tech sector sentiment",
             "VO": "Mid-cap ETF - verify no major economic news",
@@ -697,76 +562,62 @@ class OfflineTradingPlanner:
             "PFF": "Preferred stock ETF - check interest rate news",
             "VNQ": "REIT ETF - sensitive to interest rates",
         }
-
         if ticker in ticker_notes:
             notes.append(ticker_notes[ticker])
-
         return "\n".join(notes)
 
     def _is_third_week_end(self) -> bool:
-        """Check if today is the end of third week"""
+        """Check if today is the end of third week of the month."""
         today = datetime.date.today()
-        day = today.day
+        return 15 <= today.day <= 21 and today.weekday() in [3, 4]
 
-        # Between 15-21 and it's Thursday or Friday
-        if 15 <= day <= 21 and today.weekday() in [3, 4]:
-            return True
-        return False
-
-    def run_planning_cycle(self, decision_day, market_data_day, preloaded_data=None):
-        """Run one planning cycle for a specific date (trading_day)"""
+    def run_planning_cycle(self, decision_day, market_data_day):
+        """Run one planning cycle for a specific date."""
         print("\n" + "=" * 60)
-        print(f"Running Hi5 Planning Cycle - {decision_day}")
+        print(
+            f"Running Hi5 Planning Cycle for {decision_day.strftime('%Y-%m-%d')} using data from {market_data_day.strftime('%Y-%m-%d')}"
+        )
         print("=" * 60)
-        plans = self.check_hi5_signals(market_data_day, preloaded_data=preloaded_data)
+
+        if self.gdocs_manager:
+            print("\nUpdating Google Docs with latest portfolio information...")
+            self.gdocs_manager.update_doc(
+                portfolio_summary={},
+                orders_df=pd.DataFrame(),
+                dividends_df=pd.DataFrame(),
+                irr=0.0,
+            )
+
+        plans, trigger_context = self.check_hi5_signals(market_data_day)
+
         if plans:
             print(f"\nFound {len(plans)} trading signals!")
+            total_investment = sum(p.target_value for p in plans)
+            html_summary = f"""
+            <html><body>
+                <h2>Hi5 Trading Plan Summary</h2>
+                <p><strong>Date:</strong> {decision_day.strftime('%Y-%m-%d')}</p>
+                <p><strong>Total Investment:</strong> ${total_investment:,.2f}</p>
+                <hr><h3>Planned Trades:</h3>
+                <table border="1" cellpadding="5" cellspacing="0">
+                    <tr><th>Ticker</th><th>Action</th><th>Shares</th><th>Price</th><th>Value</th><th>Reason</th></tr>
+            """
+            for p in plans:
+                html_summary += f"<tr><td>{p.ticker}</td><td>{p.action}</td><td>{p.shares}</td><td>${p.current_price:.2f}</td><td>${p.target_value:.2f}</td><td>{p.reason}</td></tr>"
+            html_summary += """
+                </table><hr><p><strong>Next Steps:</strong></p><ol>
+                    <li>Check your calendar for trade reminders</li><li>Execute trades during market hours</li>
+                    <li>Update tracking spreadsheet after execution</li></ol>
+                <p style="color: red;"><strong>Remember:</strong> This is a plan, not a commitment. Adjust based on market conditions.</p>
+            </body></html>
+            """
+
+            # Print email content to console
+            print("\n=== Email Content ===")
+            print(html_summary)
+            print("===================\n")
+
             if self.email_manager and self.recipient_email:
-                print("\nSending daily calendar invitation (with summary)...")
-                # Build HTML summary (same as send_plan_summary_email)
-                total_investment = sum(p.target_value for p in plans)
-                html_summary = f"""
-                <html>
-                    <body>
-                        <h2>Hi5 Trading Plan Summary</h2>
-                        <p><strong>Date:</strong> {decision_day.strftime('%Y-%m-%d')}</p>
-                        <p><strong>Total Investment:</strong> ${total_investment:,.2f}</p>
-                        <hr>
-                        <h3>Planned Trades:</h3>
-                        <table border="1" cellpadding="5" cellspacing="0">
-                            <tr>
-                                <th>Ticker</th>
-                                <th>Action</th>
-                                <th>Shares</th>
-                                <th>Price</th>
-                                <th>Value</th>
-                                <th>Reason</th>
-                            </tr>
-                """
-                for plan in plans:
-                    html_summary += f"""
-                            <tr>
-                                <td>{plan.ticker}</td>
-                                <td>{plan.action}</td>
-                                <td>{plan.shares}</td>
-                                <td>${plan.current_price:.2f}</td>
-                                <td>${plan.target_value:.2f}</td>
-                                <td>{plan.reason}</td>
-                            </tr>
-                    """
-                html_summary += """
-                        </table>
-                        <hr>
-                        <p><strong>Next Steps:</strong></p>
-                        <ol>
-                            <li>Check your calendar for trade reminders</li>
-                            <li>Execute trades during market hours</li>
-                            <li>Update tracking spreadsheet after execution</li>
-                        </ol>
-                        <p style="color: red;"><strong>Remember:</strong> This is a plan, not a commitment. Adjust based on market conditions.</p>
-                    </body>
-                </html>
-                """
                 self.email_manager.send_daily_calendar_invitation(
                     self.recipient_email, plans, decision_day, html_summary
                 )
@@ -774,253 +625,182 @@ class OfflineTradingPlanner:
         else:
             print("\nNo trading signals at this time.")
             print(
-                f"Current state: Month={self.state.current_month}, First={self.state.first_exec}, Second={self.state.second_exec} Third={self.state.third_exec}"
+                f"Current state: Month={self.state.current_month}, First={self.state.first_exec}, Second={self.state.second_exec}, Third={self.state.third_exec}"
             )
-            # Send heartbeat email if email_manager is enabled
-            if self.email_manager and self.recipient_email:
-                subject = f"Hi5 Heartbeat: No trades for {decision_day.strftime('%Y-%m-%d')}"
-                body = f"""
+
+            # Create and print heartbeat message
+            subject = (
+                f"Hi5 Heartbeat: No trades for {decision_day.strftime('%Y-%m-%d')}"
+            )
+            body = f"""
 Hi5 Heartbeat Notification
 
 No trading signals were detected for {decision_day.strftime('%Y-%m-%d')}.
+This is an automated message to confirm the planner is running.
 
-This is an automated message to confirm the Hi5 Offline Trading Planner is running and monitoring the market as expected.
+---
+Trigger Status:
+- RSP Price: ${trigger_context.get('rsp_price', 0):.2f}
+- RSP Daily Return: {trigger_context.get('rsp_daily_return', 0)*100:+.2f}% (Triggered: {trigger_context.get('first_exec_triggered', False)})
+- RSP MTD Return: {(trigger_context.get('rsp_mtd_return') or 0)*100:.2f}% (Triggered: {trigger_context.get('second_exec_triggered', False)})
+- MA50 Ratio: {(trigger_context.get('ma50_ratio') or 0):.2%} (Triggered: {trigger_context.get('third_exec_triggered', False)})
+---
 
 Current state:
 - Month: {self.state.current_month}
 - First Exec: {self.state.first_exec}
 - Second Exec: {self.state.second_exec}
 - Third Exec: {self.state.third_exec}
-
-If you have any questions or need to adjust the strategy, please check the logs or contact the system administrator.
 """
+            # Print heartbeat message to console
+            print("\n=== Heartbeat Message ===")
+            print(f"Subject: {subject}")
+            print(body)
+            print("=======================\n")
+
+            if self.email_manager and self.recipient_email:
                 try:
                     msg = MIMEMultipart("alternative")
                     msg["Subject"] = subject
                     msg["From"] = self.email_manager.smtp_username
                     msg["To"] = self.recipient_email
                     msg.attach(MIMEText(body, "plain"))
-                    with smtplib.SMTP(self.email_manager.smtp_server, self.email_manager.smtp_port) as server:
+                    with smtplib.SMTP(
+                        self.email_manager.smtp_server, self.email_manager.smtp_port
+                    ) as server:
                         server.starttls()
-                        server.login(self.email_manager.smtp_username, self.email_manager.smtp_password)
+                        server.login(
+                            self.email_manager.smtp_username,
+                            self.email_manager.smtp_password,
+                        )
                         server.send_message(msg)
                     print(f"Heartbeat email sent to {self.recipient_email}")
                 except Exception as e:
                     print(f"Error sending heartbeat email: {e}")
 
-    def run_range(self):
-        """Run planning cycle for each date in test_dates (range mode)"""
-        if not self.test_dates:
-            print("No test date range provided.")
-            return
-        # Efficient batch download for all tickers and all dates
+    def run(self):
+        """Run planning cycle for each date in test_dates."""
         start_date = self.test_dates[0]
         end_date = self.test_dates[-1]
-        # Download from (start_date - 1 day) to end_date
-        download_start = start_date - datetime.timedelta(days=1)
-        print(
-            f"Batch downloading all ticker data from {download_start.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
-        )
-        all_tickers = self.tickers + [self.benchmark_ticker]
-        data = yf.download(
-            all_tickers,
-            start=download_start.strftime("%Y-%m-%d"),
-            end=(end_date + datetime.timedelta(days=1)).strftime("%Y-%m-%d"),
-            group_by="ticker",
-            progress=False,
-            auto_adjust=False,
-        )
-        # For single ticker, data is not multi-indexed
-        if len(all_tickers) == 1:
-            data = {all_tickers[0]: data}
-        self._batch_data = data
-        # After downloading data...
-        available_dates = data.index
 
-        for d in self.test_dates:
-            d_ts = pd.Timestamp(d)
-            prev_trading_days = available_dates[available_dates < d_ts]
-            if len(prev_trading_days) == 0:
-                print(
-                    f"Skipping {d.strftime('%Y-%m-%d')}: no previous trading day available."
-                )
-                continue
-            prev_trading_day = prev_trading_days[-1]
-            self.run_planning_cycle(
-                decision_day=d, market_data_day=prev_trading_day, preloaded_data=data
+        query = f"""
+        SELECT DISTINCT date FROM `{self.project_id}.market_data.marketing`
+        WHERE date >= DATE('{start_date.strftime('%Y-%m-%d')}') AND date <= DATE('{end_date.strftime('%Y-%m-%d')}')
+        ORDER BY date
+        """
+        all_trading_days = [row.date for row in self.bq_client.query(query).result()]
+
+        if not all_trading_days:
+            print("No trading days found in BigQuery for the specified date range.")
+            return
+
+        for decision_day in self.test_dates:
+            # Find the latest available market data day for the given decision day
+            market_data_day = next(
+                (d for d in reversed(all_trading_days) if d <= decision_day.date()),
+                None,
             )
 
-    def run_continuous(self, check_interval_minutes=60):
-        """Run continuously, checking periodically"""
-        print("Starting Hi5 Offline Trading Planner...")
-        print(f"Will check for signals every {check_interval_minutes} minutes")
-        print("\nPress Ctrl+C to stop\n")
-        while True:
-            try:
-                now = datetime.datetime.now()
-                et_tz = pytz.timezone("America/New_York")
-                et_now = et_tz.localize(now.replace(tzinfo=None))
-                if et_now.weekday() < 5 and 8 <= et_now.hour < 17:
-                    self.run_planning_cycle(
-                        trading_day=now, market_data_day=now, preloaded_data=None
-                    )
-                else:
-                    print(f"{now}: Market closed, skipping check")
-                time.sleep(check_interval_minutes * 60)
-            except KeyboardInterrupt:
-                print("\nShutting down...")
-                break
-            except Exception as e:
-                print(f"Error in planning cycle: {e}")
-                time.sleep(60)  # Wait a minute before retrying
+            if market_data_day:
+                self.run_planning_cycle(
+                    decision_day=decision_day, market_data_day=market_data_day
+                )
+            else:
+                print(
+                    f"Skipping {decision_day.strftime('%Y-%m-%d')}: no previous or current trading day data available."
+                )
 
 
 def load_smtp_config(config_file="smtp-config.json"):
-    """Load SMTP configuration from JSON file"""
+    """Load SMTP configuration from JSON file."""
+    if not os.path.exists(config_file):
+        print(f"Warning: SMTP config file {config_file} not found.")
+        return None
     try:
-        if not os.path.exists(config_file):
-            print(f"Error: SMTP config file {config_file} does not exist.")
-            return None
-
         with open(config_file, "r") as f:
             config = json.load(f)
-
-        required_fields = ["server", "port", "username", "password", "use_tls"]
-        if not all(field in config for field in required_fields):
-            print(f"Error: SMTP config file missing required fields: {required_fields}")
+        required = ["server", "port", "username", "password"]
+        if not all(field in config for field in required):
+            print(f"Error: SMTP config file missing one of: {required}")
             return None
-
         return config
-    except Exception as e:
+    except (json.JSONDecodeError, Exception) as e:
         print(f"Error loading SMTP config: {e}")
         return None
 
 
 def main():
     """Main entry point"""
-    import argparse
-
     parser = argparse.ArgumentParser(description="Hi5 Offline Trading Planner")
     parser.add_argument("--email", help="Email address for notifications")
     parser.add_argument(
-        "--smtp-config",
-        help="Path to SMTP config file (default: smtp-config.json)",
-        default="smtp-config.json",
+        "--smtp-config", default="smtp-config.json", help="Path to SMTP config file"
     )
     parser.add_argument(
-        "--test-date", help="Test date in YYYY-MM-DD format (e.g., 2024-01-15)"
+        "--test-date",
+        help="Test date (YYYY-MM-DD) or range (YYYY-MM-DD:YYYY-MM-DD). Defaults to yesterday.",
     )
     parser.add_argument(
         "--engine",
         choices=["local", "memory", "gcp"],
         default="local",
-        help="State storage engine: local (default), memory, or gcp",
+        help="State storage engine",
     )
     parser.add_argument(
-        "--gcp-config",
-        help="Path to GCP config file (default: gcp_config.json)",
-        default="gcp-config.json",
+        "--gcp-config", default="gcp-config.json", help="Path to GCP config file"
     )
-
+    parser.add_argument("--gdocs-document-id", help="ID of the Google Doc to update.")
     args = parser.parse_args()
 
-    # Parse test date if provided, else use today
+    test_dates = []
     if args.test_date:
         try:
-            test_dates = parse_test_dates(args.test_date)
+            if ":" in args.test_date:
+                start_str, end_str = args.test_date.split(":", 1)
+                start_date = datetime.datetime.strptime(start_str, "%Y-%m-%d")
+                end_date = datetime.datetime.strptime(end_str, "%Y-%m-%d")
+                if end_date < start_date:
+                    raise ValueError("End date must not be before start date")
+                test_dates = [
+                    start_date + datetime.timedelta(days=i)
+                    for i in range((end_date - start_date).days + 1)
+                ]
+            else:
+                test_dates = [datetime.datetime.strptime(args.test_date, "%Y-%m-%d")]
         except ValueError as e:
-            print(f"Error: {e}")
+            print(f"Error parsing --test-date: {e}")
             return
-    else:
-        # Default: today
-        test_dates = [datetime.datetime.now() - datetime.timedelta(days=1)]
 
-    # Load SMTP config if email is enabled
-    smtp_config = None
-    if args.email:
-        smtp_config = load_smtp_config(args.smtp_config)
-        if not smtp_config:
-            print(f"Error: Could not load SMTP configuration from {args.smtp_config}")
-            print("Please create a smtp-config.json file with the following format:")
-            print(
-                """
-{
-    "server": "smtp.gmail.com",
-    "port": 587,
-    "username": "your-email@gmail.com",
-    "password": "your-app-password"
-}
-                """
+    smtp_config = load_smtp_config(args.smtp_config) if args.email else {}
+
+    try:
+        with open(args.gcp_config, "r") as f:
+            gcp_config = json.load(f)
+        if not gcp_config.get("project_id") or not gcp_config.get("credentials_path"):
+            raise ValueError(
+                "GCP config must contain 'project_id' and 'credentials_path'"
             )
-            return
-
-    # check gcp_config file exists
-    with open(args.gcp_config, "r") as f:
-        gcp_config = json.load(f)
-    if not gcp_config:
-        print(f"Error: GCP config file {args.gcp_config} is empty.")
-        return
-    if (
-        not gcp_config.get("bucket_name")
-        or not gcp_config.get("blob_name")
-    ):
-        print(f"Error: GCP config file {args.gcp_config} is missing required fields.")
+    except (FileNotFoundError, ValueError) as e:
+        print(f"Error with GCP config file {args.gcp_config}: {e}")
         return
 
-    # Configuration
     config = {
         "recipient_email": args.email,
-        "smtp_server": smtp_config["server"] if smtp_config else None,
-        "smtp_port": smtp_config["port"] if smtp_config else None,
-        "smtp_username": smtp_config["username"] if smtp_config else None,
-        "smtp_password": smtp_config["password"] if smtp_config else None,
-        "test_date": test_dates,
+        "smtp_server": smtp_config.get("server"),
+        "smtp_port": smtp_config.get("port"),
+        "smtp_username": smtp_config.get("username"),
+        "smtp_password": smtp_config.get("password"),
+        "test_dates": test_dates,
         "engine": args.engine,
-        "bucket_name": gcp_config.get("bucket_name") if args.engine == "gcp" else None,
-        "blob_name": gcp_config.get("blob_name") if args.engine == "gcp" else None,
+        "bucket_name": gcp_config.get("bucket_name"),
+        "blob_name": gcp_config.get("blob_name"),
         "credentials_path": gcp_config.get("credentials_path"),
         "project_id": gcp_config.get("project_id"),
+        "gdocs_document_id": args.gdocs_document_id,
     }
 
-    # Create planner
     planner = OfflineTradingPlanner(**config)
-
-    # Get trading days from BigQuery
-    trading_days_query = f"""
-    SELECT DISTINCT date
-    FROM `{planner.project_id}.market_data.marketing`
-    WHERE date >= DATE('{test_dates[0].strftime('%Y-%m-%d')}')
-    AND date <= DATE('{test_dates[-1].strftime('%Y-%m-%d')}')
-    ORDER BY date
-    """
-    
-    print(f"trading_days_query: {trading_days_query}")
-    trading_days_result = planner.bq_client.query(trading_days_query).result()
-    print(f"trading_days_result: {trading_days_result}")
-    trading_days = [row.date for row in trading_days_result]
-    
-    if not trading_days:
-        print(f"No trading days found in BigQuery for the specified date range")
-        return
-
-    print(f"Found {len(trading_days)} trading days in BigQuery")
-
-    for d in test_dates:
-        d_ts = pd.Timestamp(d)
-        # Find the previous trading day from BigQuery results
-        prev_trading_days = [td for td in trading_days if td <= d_ts.date()]
-        if not prev_trading_days:
-            print(f"Skipping {d.strftime('%Y-%m-%d')}: no previous trading day available.")
-            continue
-            
-        prev_trading_day = prev_trading_days[-1]
-        print(f"Processing {d.strftime('%Y-%m-%d')} using market data from {prev_trading_day}")
-        
-        # Update market data and run planning cycle
-        planner.update_market_data(prev_trading_day)
-        planner.run_planning_cycle(
-            decision_day=d, market_data_day=prev_trading_day
-        )
+    planner.run()
 
 
 if __name__ == "__main__":

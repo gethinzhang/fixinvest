@@ -165,7 +165,12 @@ class Hi5State:
         self.first_exec = getattr(self, "first_exec", False)
         self.second_exec = getattr(self, "second_exec", False)
         self.third_exec = getattr(self, "third_exec", False)
-        self.rebalanced_this_year_august = getattr(self, "rebalanced_this_year_august", False)
+        self.rebalanced_this_year_august = getattr(
+            self, "rebalanced_this_year_august", False
+        )
+        self.current_contribution_amount = getattr(
+            self, "current_contribution_amount", None
+        )
 
     def restore_state(self):
         self.storage_engine.load()
@@ -173,7 +178,12 @@ class Hi5State:
         self.first_exec = self.storage_engine.get("first_exec", False)
         self.second_exec = self.storage_engine.get("second_exec", False)
         self.third_exec = self.storage_engine.get("third_exec", False)
-        self.rebalanced_this_year_august = self.storage_engine.get("rebalanced_this_year_august", False)
+        self.rebalanced_this_year_august = self.storage_engine.get(
+            "rebalanced_this_year_august", False
+        )
+        self.current_contribution_amount = self.storage_engine.get(
+            "current_contribution_amount"
+        )
         self._initialize_defaults()
 
     def save_state(self):
@@ -181,7 +191,12 @@ class Hi5State:
         self.storage_engine.set("first_exec", self.first_exec)
         self.storage_engine.set("second_exec", self.second_exec)
         self.storage_engine.set("third_exec", self.third_exec)
-        self.storage_engine.set("rebalanced_this_year_august", self.rebalanced_this_year_august)
+        self.storage_engine.set(
+            "rebalanced_this_year_august", self.rebalanced_this_year_august
+        )
+        self.storage_engine.set(
+            "current_contribution_amount", self.current_contribution_amount
+        )
         self.storage_engine.save()
 
     def refresh_to_new_month(self, rsp_data_feed):
@@ -194,26 +209,39 @@ class Hi5State:
         if self.current_month == 1:
             self.rebalanced_this_year_august = False
 
+        # Update contribution amount if in incremental mode
+        if self.p.contribution_mode == "incremental":
+            self.current_contribution_amount += self.p.monthly_increment
+
         self.save_state()
 
 
 class Hi5Strategy(bt.Strategy):
     params = (
         ('tickers', []),
+        ('benchmark_ticker', 'RSP'),
         ('enable_cash_injection', True),
         ('cash_injection_threshold', 5),
         ('cash_per_contribution', 10000),
         ('market_breadth_df', None),
-        ('state', Hi5State(storage_engine=InMemoryStorageEngine()))
+        ('state', Hi5State(storage_engine=InMemoryStorageEngine())),
+        ("contribution_mode", "fixed"),
+        ("monthly_increment", 500.0),
+        ("contribution_percentage", 0.01),
     )
 
     def __init__(self):
         super().__init__()
         self.state = self.p.state
         self.data_feeds = {data._name: data for data in self.datas}
-        self.benchmark_ticker = "RSP"
+        self.benchmark_ticker = self.p.benchmark_ticker
         self.tickers = self.p.tickers
         
+        # Initialize the contribution amount in the state if it's not already set
+        if self.state.current_contribution_amount is None:
+            self.state.current_contribution_amount = self.p.cash_per_contribution
+            self.state.save_state()
+
         if self.p.market_breadth_df is not None:
             self.market_breadth = MarketBreadthIndicator(
                 self.data_feeds[self.benchmark_ticker],
@@ -245,13 +273,22 @@ class Hi5Strategy(bt.Strategy):
         
         # Check for August 1st rebalancing
         if current_date.month == 8 and current_date.day == 1:
-            self._rebalance_portfolio("Annual rebalancing on August 1st")
+            portfolio_value = self.broker.getvalue()
+            reason = f"Annual rebalancing on August 1st. Pre-rebalance value: ${portfolio_value:,.2f}"
+            self._rebalance_portfolio(reason)
         
         if self.state.current_month is None or self.state.current_month != current_date.month:
             self.state.current_month = current_date.month
             self.state.first_exec = False
             self.state.second_exec = False
             self.state.third_exec = False
+            # Update contribution amount if in incremental mode, with a cap
+            if self.p.contribution_mode == "incremental":
+                cap = self.p.cash_per_contribution * 2
+                new_amount = (
+                    self.state.current_contribution_amount + self.p.monthly_increment
+                )
+                self.state.current_contribution_amount = min(new_amount, cap)
             self.state.save_state()
 
         rsp_data = self.data_feeds[self.benchmark_ticker]
@@ -294,63 +331,82 @@ class Hi5Strategy(bt.Strategy):
         if any([self.state.first_exec, self.state.second_exec, self.state.third_exec]):
             self.state.save_state()
 
+    def _get_investment_amount(self):
+        """Calculates the investment amount based on the contribution mode."""
+        mode = self.p.contribution_mode
+        if mode == "fixed":
+            return self.p.cash_per_contribution
+        elif mode == "incremental":
+            return self.state.current_contribution_amount
+        elif mode == "percentage":
+            portfolio_value = self.broker.getvalue()
+            return max(self.p.cash_per_contribution, portfolio_value * self.p.contribution_percentage)
+        return self.p.cash_per_contribution  # Fallback to fixed
+
     def _rebalance_portfolio(self, reason):
-        """Rebalance portfolio to equal weights by only adjusting positions that deviate from target"""
-        # Calculate total portfolio value
-        total_value = self.broker.getvalue()
-        target_per_position = total_value / len(self.tickers)
-        
-        # Calculate current positions and their values
-        current_positions = {}
+        """Rebalance portfolio to equal weights based on stock value, not including cash."""
+        total_stock_value = 0.0
+        for ticker in self.tickers:
+            price = self.data_feeds[ticker].close[0]
+            if price and not np.isnan(price):
+                total_stock_value += (
+                    self.getposition(self.data_feeds[ticker]).size * price
+                )
+
+        if total_stock_value <= 0:
+            return  # Cannot rebalance if no stocks are held
+
+        target_per_position = total_stock_value / len(self.tickers)
+
+        # Adjust positions that deviate from target
         for ticker in self.tickers:
             data = self.data_feeds[ticker]
-            position = self.getposition(data)
-            current_value = position.size * data.close[0] if position.size > 0 else 0
-            current_positions[ticker] = {
-                'data': data,
-                'size': position.size,
-                'value': current_value,
-                'price': data.close[0]
-            }
-        
-        # Adjust positions that deviate from target
-        for ticker, pos in current_positions.items():
-            if not pos['price'] or pos['price'] <= 0:
+            price = data.close[0]
+            if not price or price <= 0 or np.isnan(price):
                 continue
-                
+
+            position = self.getposition(data)
+            current_value = position.size * price
+
             target_value = target_per_position
-            current_value = pos['value']
             value_diff = target_value - current_value
-            
+
             # Only trade if the difference is significant (e.g., >1% of target)
             if abs(value_diff) > target_value * 0.01:
                 if value_diff > 0:  # Need to buy more
-                    shares = int(value_diff / pos['price'])
+                    shares = int(value_diff / price)
                     if shares > 0:
-                        order = self.buy(data=pos['data'], size=shares)
+                        order = self.buy(data=data, size=shares)
                         order.reason = reason
                 else:  # Need to sell some
-                    shares = int(abs(value_diff) / pos['price'])
+                    shares = int(abs(value_diff) / price)
                     if shares > 0:
-                        order = self.sell(data=pos['data'], size=shares)
+                        order = self.sell(data=data, size=shares)
                         order.reason = reason
 
     def _execute_trades(self, reason, multiplier=1):
-        total_investment = self.p.cash_per_contribution * multiplier
-        investment_per_ticker = total_investment / len(self.tickers)
+        investment_amount = self._get_investment_amount()
+        total_investment_needed = investment_amount * multiplier
+        current_cash = self.broker.get_cash()
 
-        if hasattr(self, 'analyzers') and self.analyzers.hi5analyzer:
-            self.analyzers.hi5analyzer.record_investment(
-                self.data.datetime.date(0),
-                total_investment,
-                reason
-            )
+        # If cash is not enough, inject the required amount
+        if current_cash < total_investment_needed:
+            deposit_amount = total_investment_needed - current_cash
+            self.broker.add_cash(deposit_amount)
+            if hasattr(self, "analyzers") and self.analyzers.hi5analyzer:
+                self.analyzers.hi5analyzer.record_investment(
+                    self.data.datetime.date(0),
+                    deposit_amount,
+                    f"Cash injection for: {reason}",
+                )
+
+        investment_per_ticker = total_investment_needed / len(self.tickers)
 
         for ticker in self.tickers:
             data = self.data_feeds[ticker]
             price = data.close[0]
-            
-            if price and price > 0:
+
+            if price and price > 0 and not np.isnan(price):
                 shares = int(investment_per_ticker / price)
                 if shares > 0:
                     order = self.buy(data=data, size=shares)

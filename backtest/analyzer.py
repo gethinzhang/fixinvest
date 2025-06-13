@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import numpy_financial as npf
 from datetime import date
+import csv
 
 
 class BacktestAnalyzer(bt.Analyzer):
@@ -15,18 +16,28 @@ class BacktestAnalyzer(bt.Analyzer):
           including a monthly IRR calculation. If False, uses standard portfolio analysis.
     """
 
-    params = (("risk_free_rate", 0.04), ("fix_investment", False), ("non_resident_tax_rate", 0.3))
+    params = (
+        ("risk_free_rate", 0.04),
+        ("fix_investment", False),
+        ("non_resident_tax_rate", 0.3),
+        ("print_drawdown_history", False),
+    )
 
     def __init__(self):
         super().__init__()
-        # Data storage
-        self.trade_history = []
+        self.strategy = self.strategy
+        self.data_feeds = {data._name: data for data in self.datas}
+
+        # Data stores
         self.portfolio_values = []
-        self.dates = []
         self.cash_values = []
         self.stock_values = []
-        self.investment_schedule = []
+        self.dates = []
+        self.trading_log = []
+        self.dividend_log = []
+        self.investment_log = []
         self.final_positions = []
+        self.final_stock_value = 0.0
 
         # Metrics tracking
         self.total_investor_deposits = 0.0
@@ -36,7 +47,6 @@ class BacktestAnalyzer(bt.Analyzer):
 
         # For monthly IRR in fix_investment mode
         self.monthly_portfolio_values = []
-        self.monthly_dates = []
         self.monthly_cashflows = []
         self.current_month_cashflow = 0.0
         self.last_month = None
@@ -62,12 +72,12 @@ class BacktestAnalyzer(bt.Analyzer):
                 "commission": order.executed.comm,
                 "reason": getattr(order, "reason", "N/A"),
             }
-            self.trade_history.append(order_info)
+            self.trading_log.append(order_info)
 
     def record_investment(self, date, amount, reason):
         """Records an investment/deposit transaction."""
         investment_record = {"date": date, "amount": amount, "reason": reason}
-        self.investment_schedule.append(investment_record)
+        self.investment_log.append(investment_record)
         self.total_investor_deposits += amount
         if self.p.fix_investment:
             self.current_month_cashflow += amount
@@ -87,10 +97,11 @@ class BacktestAnalyzer(bt.Analyzer):
             "price": gross_amount / shares_held if shares_held else 0,
             "size": shares_held,
             "value": gross_amount,
+            "net_value": net_dividend,
             "commission": calculated_tax,
             "reason": f"Net: ${net_dividend:.2f} (Tax: {tax_rate*100:.0f}%)",
         }
-        self.trade_history.append(dividend_info)
+        self.dividend_log.append(dividend_info)
         self.total_dividend_cash += net_dividend
         self.total_gross_dividends += gross_amount
         self.total_dividend_tax += calculated_tax
@@ -103,110 +114,212 @@ class BacktestAnalyzer(bt.Analyzer):
         )
 
     def next(self):
-        if not hasattr(self, "strategy") or self.strategy is None:
-            return
-
         current_date = self.strategy.datetime.date(0)
-        cash_value = self.strategy.broker.get_cash() + self.total_dividend_cash
-        stock_value = sum(
-            self.strategy.getposition(data).size * data.close[0]
-            for data in self.strategy.datas
-            if self.strategy.getposition(data).size > 0
-        )
+        self.dates.append(current_date)
 
+        cash_value = self.strategy.broker.get_cash()
+        stock_value = 0.0
+        for data in self.strategy.datas:
+            position = self.strategy.getposition(data)
+            if position.size != 0:
+                price = data.close[0]
+                if price and not np.isnan(price):
+                    stock_value += position.size * price
+        
         portfolio_value = cash_value + stock_value
         self.portfolio_values.append(portfolio_value)
         self.cash_values.append(cash_value)
         self.stock_values.append(stock_value)
-        self.dates.append(current_date)
 
         if self.p.fix_investment:
-            current_month = (current_date.year, current_date.month)
+            current_month = current_date.month
             if self.last_month is None:
                 self.last_month = current_month
-                self.monthly_portfolio_values.append(portfolio_value)
-                self.monthly_dates.append(current_date)
-            elif current_month != self.last_month:
+
+            if current_month != self.last_month:
                 self.monthly_cashflows.append(self.current_month_cashflow)
                 self.current_month_cashflow = 0.0
-
-                self.monthly_portfolio_values.append(portfolio_value)
-                self.monthly_dates.append(current_date)
                 self.last_month = current_month
-            else:  # Same month
-                if self.monthly_portfolio_values:
-                    self.monthly_portfolio_values[-1] = portfolio_value
-                    self.monthly_dates[-1] = current_date
-
+    
     def stop(self):
-        """Finalize calculations at the end of the backtest."""
         if self.p.fix_investment:
             # Append the last month's cashflow
             self.monthly_cashflows.append(self.current_month_cashflow)
 
         self.capture_final_positions(self.strategy)
 
+    def capture_final_positions(self, strat):
+        self.final_stock_value = 0.0
+        positions = []
+
+        # Create a summary of total dividends received per ticker
+        ticker_dividends = {}
+        for div_event in self.dividend_log:
+            ticker = div_event["ticker"]
+            amount = div_event["net_value"]
+            ticker_dividends[ticker] = ticker_dividends.get(ticker, 0) + amount
+
+        # Iterate through all data feeds, which is more reliable than strat.positions
+        for data in strat.datas:
+            pos = strat.getposition(data)
+            if pos.size == 0:
+                continue
+
+            ticker = data._name
+            # Skip FX feeds if they are present
+            if ticker.endswith("=X"):
+                continue
+
+            price = data.close[0]
+            value = 0.0
+            unrealized_pnl = 0.0
+            
+            dividends_received = ticker_dividends.get(ticker, 0.0)
+            total_pnl = 0.0
+
+            if price and not np.isnan(price):
+                value = pos.size * price
+                unrealized_pnl = (price - pos.price) * pos.size
+            
+            total_pnl = unrealized_pnl + dividends_received
+            self.final_stock_value += value
+
+            positions.append(
+                {
+                    "Ticker": ticker,
+                    "Shares": pos.size,
+                    "Avg Cost Price": pos.price,
+                    "Market Price": price,
+                    "Market Value": value,
+                    "Unrealized PnL": unrealized_pnl,
+                    "Dividends Received": dividends_received,
+                    "Total PnL": total_pnl,
+                }
+            )
+        self.final_positions = positions
+
     def get_analysis(self):
         if not self.dates or not self.portfolio_values:
             return {}
 
-        metrics = self._calculate_metrics()
-
-        self.trade_history.sort(key=lambda x: x["date"])
-        trades_df = pd.DataFrame(self.trade_history)
-
-        portfolio_history_df = pd.DataFrame(
-            {
-                "Date": self.dates,
-                "Total Value": self.portfolio_values,
-                "Cash": self.cash_values,
-                "Stocks": self.stock_values,
-                "Cash %": [
-                    (c / t * 100) if t > 0 else 0
-                    for c, t in zip(self.cash_values, self.portfolio_values)
-                ],
-                "Stocks %": [
-                    (s / t * 100) if t > 0 else 0
-                    for s, t in zip(self.stock_values, self.portfolio_values)
-                ],
-            }
-        )
-
-        analysis = {
-            "summary_metrics": metrics,
-            "trades": trades_df,
-            "portfolio_history": portfolio_history_df,
-            "final_positions": pd.DataFrame(self.final_positions),
-        }
-        if self.p.fix_investment:
-            analysis["investment_schedule"] = self.investment_schedule
-
-        return analysis
-
-    def _calculate_metrics(self):
-        sharpe = self._calculate_sharpe_ratio()
-        max_dd = self._calculate_max_drawdown()
-        monthly_irr, annual_irr = self._calculate_irr()
+        (
+            max_dd,
+            peak_date,
+            peak_price,
+            trough_date,
+            trough_price,
+            drawdown_history_df,
+        ) = self._calculate_max_drawdown()
+        monthly_irr, annual_irr = self._calculate_ir()
 
         final_value = self.portfolio_values[-1]
         pnl = final_value - self.total_investor_deposits
 
-        return {
-            "Start Date": self.dates[0],
-            "End Date": self.dates[-1],
-            "Initial Portfolio Value": self.portfolio_values[0],
-            "Final Portfolio Value": final_value,
-            "Total Net Deposits": self.total_investor_deposits,
-            "Total Gross Dividends": self.total_gross_dividends,
-            "Total Dividend Tax": self.total_dividend_tax,
-            "Net P&L": pnl,
-            "Sharpe Ratio": sharpe,
-            "Max Drawdown": max_dd,
-            "Monthly IRR": monthly_irr if self.p.fix_investment else "N/A",
-            "Annual IRR": annual_irr,
-        }
+        # Non-fixed investment ROI
+        roi_annualized = 0.0
+        if not self.p.fix_investment and self.total_investor_deposits > 0:
+            total_return = pnl / self.total_investor_deposits
+            duration_years = (self.dates[-1] - self.dates[0]).days / 365.25
+            if duration_years > 0:
+                roi_annualized = (1 + total_return) ** (1 / duration_years) - 1
 
-    def _calculate_irr(self):
+        return {
+            "summary_metrics": {
+                "Start Date": self.dates[0],
+                "End Date": self.dates[-1],
+                "Initial Portfolio Value": self.portfolio_values[0],
+                "Final Portfolio Value": final_value,
+                "Total Net Deposits": self.total_investor_deposits,
+                "Total Gross Dividends": self.total_gross_dividends,
+                "Total Dividend Tax": self.total_dividend_tax,
+                "Net P&L": pnl,
+                "Sharpe Ratio": self._calculate_sharpe_ratio(),
+                "Max Drawdown": {
+                    "Max DD": max_dd,
+                    "Peak Date": peak_date,
+                    "Peak Price": peak_price,
+                    "Trough Date": trough_date,
+                    "Trough Price": trough_price,
+                },
+                "Monthly IRR": monthly_irr,
+                "Annual IRR": annual_irr,
+                "Annualized ROI": roi_annualized,
+            },
+            "final_positions": self.final_positions,
+            "trade_history": pd.DataFrame(self.trading_log),
+            "dividend_history": pd.DataFrame(self.dividend_log),
+            "investment_history": pd.DataFrame(self.investment_log),
+            "drawdown_history": drawdown_history_df,
+        }
+    
+    def _calculate_sharpe_ratio(self):
+        if not self.portfolio_values or len(self.portfolio_values) < 2:
+            return 0.0
+
+        returns_df = pd.DataFrame(
+            {"value": self.portfolio_values}, index=pd.to_datetime(self.dates)
+        )
+        monthly_returns = (
+            returns_df["value"].resample("ME").last().pct_change(fill_method=None).dropna()
+        )
+
+        if monthly_returns.empty or monthly_returns.std() == 0:
+            return 0.0
+
+        monthly_risk_free = (1 + self.p.risk_free_rate) ** (1 / 12) - 1
+        excess_returns = monthly_returns - monthly_risk_free
+        std_dev = excess_returns.std()
+
+        if std_dev > 0:
+            return np.sqrt(12) * excess_returns.mean() / std_dev
+        return 0.0
+
+    def _calculate_max_drawdown(self):
+        if not self.portfolio_values:
+            return 0.0, None, None, None, None, None
+
+        portfolio_values_np = np.array(self.portfolio_values)
+        peak = np.maximum.accumulate(portfolio_values_np)
+
+        non_zero_peak_indices = peak != 0
+        drawdown = np.zeros_like(portfolio_values_np, dtype=float)
+
+        if np.any(non_zero_peak_indices):
+            drawdown[non_zero_peak_indices] = (
+                peak[non_zero_peak_indices]
+                - portfolio_values_np[non_zero_peak_indices]
+            ) / peak[non_zero_peak_indices]
+
+            max_dd = np.max(drawdown)
+            if max_dd > 0:
+                trough_idx = np.argmax(drawdown)
+                peak_value = peak[trough_idx]
+                peak_idx = np.where(portfolio_values_np[: trough_idx + 1] == peak_value)[
+                    0
+                ][0]
+
+                peak_date = self.dates[peak_idx]
+                trough_date = self.dates[trough_idx]
+                trough_price = portfolio_values_np[trough_idx]
+
+                drawdown_dates = self.dates[peak_idx : trough_idx + 1]
+                drawdown_values = self.portfolio_values[peak_idx : trough_idx + 1]
+                drawdown_df = pd.DataFrame(
+                    {"Date": drawdown_dates, "Portfolio Value": drawdown_values}
+                )
+
+                return (
+                    max_dd,
+                    peak_date,
+                    peak_value,
+                    trough_date,
+                    trough_price,
+                    drawdown_df,
+                )
+
+        return 0.0, None, None, None, None, None
+
+    def _calculate_ir(self):
         if self.p.fix_investment:
             if not self.monthly_cashflows or len(self.monthly_cashflows) < 2:
                 return 0.0, 0.0
@@ -245,119 +358,7 @@ class BacktestAnalyzer(bt.Analyzer):
             monthly_roi = (1 + annual_roi) ** (1 / 12) - 1  # Just for reference
             return monthly_roi, annual_roi
 
-    def _calculate_sharpe_ratio(self):
-        # Using monthly returns for Sharpe Ratio calculation
-        # This part of the logic is complex for fix_investment with cashflows,
-        # using simple portfolio returns for now.
-        returns_df = pd.DataFrame(
-            self.portfolio_values,
-            index=pd.to_datetime(self.dates),
-            columns=["value"],
-        )
-        monthly_returns = returns_df["value"].resample("ME").last().pct_change().dropna()
-
-        if len(monthly_returns) < 2:
-            return 0.0
-
-        monthly_risk_free = (1 + self.p.risk_free_rate) ** (1 / 12) - 1
-        excess_returns = monthly_returns - monthly_risk_free
-        std_dev = excess_returns.std()
-
-        if std_dev > 0:
-            return np.sqrt(12) * excess_returns.mean() / std_dev
-        return 0.0
-
-    def _calculate_max_drawdown(self):
-        if not self.portfolio_values:
-            return 0.0
-
-        portfolio_values_np = np.array(self.portfolio_values)
-        peak = np.maximum.accumulate(portfolio_values_np)
-
-        non_zero_peak_indices = peak != 0
-        drawdown = np.zeros_like(portfolio_values_np, dtype=float)
-
-        if np.any(non_zero_peak_indices):
-            drawdown[non_zero_peak_indices] = (
-                peak[non_zero_peak_indices]
-                - portfolio_values_np[non_zero_peak_indices]
-            ) / peak[non_zero_peak_indices]
-            return np.max(drawdown)
-        return 0.0
-
-    def capture_final_positions(self, strategy):
-        self.final_positions = []
-        ticker_dividends = {}
-        ticker_dividend_tax = {}
-
-        for trade in self.trade_history:
-            if trade["type"] == "DIVIDEND":
-                ticker = trade["ticker"]
-                ticker_dividends.setdefault(ticker, 0)
-                ticker_dividend_tax.setdefault(ticker, 0)
-                ticker_dividends[ticker] += trade["value"]
-                ticker_dividend_tax[ticker] += trade["commission"]
-
-        for data in strategy.datas:
-            position = strategy.getposition(data)
-            if position.size > 0:
-                ticker = data._name
-                current_price = data.close[0]
-                market_value = position.size * current_price
-                avg_cost = abs(position.price)
-                total_cost = position.size * avg_cost
-                unrealized_pnl = market_value - total_cost
-                unrealized_pnl_pct = (
-                    (unrealized_pnl / total_cost * 100) if total_cost > 0 else 0
-                )
-
-                gross_dividends = ticker_dividends.get(ticker, 0)
-                dividend_tax = ticker_dividend_tax.get(ticker, 0)
-                net_dividends = gross_dividends - dividend_tax
-                total_pnl = unrealized_pnl + net_dividends
-                total_pnl_pct = (
-                    (total_pnl / total_cost * 100) if total_cost > 0 else 0
-                )
-
-                self.final_positions.append(
-                    {
-                        "Ticker": ticker,
-                        "Shares": position.size,
-                        "Current Price": current_price,
-                        "Market Value": market_value,
-                        "Average Cost": avg_cost,
-                        "Total Cost": total_cost,
-                        "Unrealized P&L": unrealized_pnl,
-                        "Unrealized P&L %": unrealized_pnl_pct,
-                        "Gross Dividends": gross_dividends,
-                        "Dividend Tax": dividend_tax,
-                        "Net Dividends": net_dividends,
-                        "Total P&L (incl. Div)": total_pnl,
-                        "Total P&L %": total_pnl_pct,
-                    }
-                )
-
-        cash_amount = strategy.broker.get_cash()
-        if cash_amount > 0:
-            self.final_positions.append(
-                {
-                    "Ticker": "CASH",
-                    "Shares": 1,
-                    "Current Price": cash_amount,
-                    "Market Value": cash_amount,
-                    "Average Cost": cash_amount,
-                    "Total Cost": cash_amount,
-                    "Unrealized P&L": 0,
-                    "Unrealized P&L %": 0,
-                    "Gross Dividends": 0,
-                    "Dividend Tax": 0,
-                    "Net Dividends": 0,
-                    "Total P&L (incl. Div)": 0,
-                    "Total P&L %": 0,
-                }
-            )
-
-    def print_summary(self, final_positions=True):
+    def print_summary(self, print_drawdown_history=None):
         """Prints a summary of the backtest results to the console."""
         analysis = self.get_analysis()
         if not analysis:
@@ -370,9 +371,19 @@ class BacktestAnalyzer(bt.Analyzer):
 
         metrics = analysis["summary_metrics"]
         for key, value in metrics.items():
-            if isinstance(value, float):
-                if key in ("Max Drawdown", "Monthly IRR", "Annual IRR"):
-                    print(f"{key:25}: {value*100:,.2f}%")
+            if key == "Max Drawdown":
+                dd_info = value
+                if dd_info and dd_info.get("Peak Date"):
+                    print(
+                        f"{'Max Drawdown':<25}: {dd_info['Max DD']:.2%} "
+                        f"(Peak: {dd_info['Peak Date'].strftime('%Y-%m-%d')} ${dd_info['Peak Price']:,.2f}, "
+                        f"Trough: {dd_info['Trough Date'].strftime('%Y-%m-%d')} ${dd_info['Trough Price']:,.2f})"
+                    )
+                elif dd_info:
+                    print(f"{'Max Drawdown':<25}: {dd_info.get('Max DD', 0.0):.2%}")
+            elif isinstance(value, float):
+                if "IRR" in key or "ROI" in key:
+                     print(f"{key:25}: {value:.2%}")
                 else:
                     print(f"{key:25}: {value:,.2f}")
             elif isinstance(value, date):
@@ -380,74 +391,80 @@ class BacktestAnalyzer(bt.Analyzer):
             else:
                 print(f"{key:25}: {value}")
 
-        if final_positions:
-            print("\n" + "=" * 50)
-            print("Final Positions")
-            print("=" * 50)
-            final_positions_df = analysis.get("final_positions")
-            if final_positions_df is not None and not final_positions_df.empty:
-                for _index, position in final_positions_df.iterrows():
-                    print("-" * 40)
-                    for col, val in position.items():
-                        if isinstance(val, float):
-                            if "%" in col:
-                                print(f"  {col:<25}: {val:,.2f}%")
-                            else:
-                                print(f"  {col:<25}: {val:,.2f}")
-                        else:
-                            print(f"  {col:<25}: {val}")
-                print("-" * 40)
-            else:
-                print("No final positions.")
+        print("\n" + "-" * 50)
+        print("Final Positions")
+        print("-" * 50)
+        positions = analysis.get("final_positions", [])
+        if not positions:
+            print("No open positions at the end of the backtest.")
+        else:
+            for pos in positions:
+                print(f"  - Ticker: {pos['Ticker']}")
+                print(f"    Shares: {pos['Shares']}")
+                print(f"    Market Value: {pos.get('Market Value', 0.0):,.2f}")
+                print(f"    Unrealized PnL:   {pos.get('Unrealized PnL', 0.0):,.2f}")
+                print(f"    Dividends Rcvd: {pos.get('Dividends Received', 0.0):,.2f}")
+                print(f"    Total PnL:        {pos.get('Total PnL', 0.0):,.2f}")
 
+        if self.p.print_drawdown_history or (
+            print_drawdown_history is not None and print_drawdown_history
+        ):
+            print("\n" + "=" * 50)
+            print("Portfolio Value During Max Drawdown")
+            print("=" * 50)
+            dd_history = analysis.get("drawdown_history")
+            if dd_history is not None and not dd_history.empty:
+                print(dd_history.to_string())
+            else:
+                print("No drawdown period to display.")
+                
     def export_to_excel(self, filename="backtest_results.xlsx"):
-        """
-        Exports the backtest analysis to an Excel file.
-        Requires `openpyxl` to be installed (`pip install openpyxl`).
-        """
+        """Exports the backtest results to an Excel file with colored transaction history."""
         analysis = self.get_analysis()
         if not analysis:
             print("No analysis data to export.")
             return
 
-        try:
-            with pd.ExcelWriter(filename, engine="openpyxl") as writer:
-                # Summary Sheet
-                summary_df = pd.DataFrame.from_dict(
-                    analysis["summary_metrics"], orient="index", columns=["Value"]
+        # Combine trade and dividend history into a single DataFrame
+        trades_df = analysis["trade_history"]
+        dividends_df = analysis["dividend_history"]
+        all_transactions_df = (
+            pd.concat([trades_df, dividends_df], sort=False)
+            .sort_values(by="date")
+            .reset_index(drop=True)
+        )
+
+        with pd.ExcelWriter(filename, engine="xlsxwriter") as writer:
+            # --- Summary Sheet ---
+            summary_df = pd.DataFrame.from_dict(
+                analysis["summary_metrics"], orient="index", columns=["Value"]
+            )
+            summary_df.index.name = "Metric"
+            summary_df.to_excel(writer, sheet_name="Summary")
+
+            # --- All Transactions Sheet (Trades + Dividends) with Colors ---
+            if not all_transactions_df.empty:
+                all_transactions_df.to_excel(
+                    writer, sheet_name="Transactions", index=False
                 )
-                summary_df.to_excel(writer, sheet_name="Summary")
+                workbook = writer.book
+                worksheet = writer.sheets["Transactions"]
+                # Add formats
+                buy_format = workbook.add_format({"bg_color": "#C6EFCE"})  # Green
+                sell_format = workbook.add_format({"bg_color": "#FFC7CE"})  # Red
+                div_format = workbook.add_format({"bg_color": "#FFEB9C"})  # Yellow
+                # Color rows based on type
+                for i, row in all_transactions_df.iterrows():
+                    if row["type"] == "BUY":
+                        worksheet.set_row(i + 1, cell_format=buy_format)
+                    elif row["type"] == "SELL":
+                        worksheet.set_row(i + 1, cell_format=sell_format)
+                    elif row["type"] == "DIVIDEND":
+                        worksheet.set_row(i + 1, cell_format=div_format)
 
-                # Final Positions Sheet
-                if not analysis["final_positions"].empty:
-                    analysis["final_positions"].to_excel(
-                        writer, sheet_name="Final Positions", index=False
-                    )
-
-                # Trades Sheet with colors
-                if not analysis["trades"].empty:
-                    trades_df = analysis["trades"]
-
-                    def style_trades(row):
-                        color = ""
-                        if row["type"] == "BUY":
-                            color = "background-color: #c6efce"  # light green
-                        elif row["type"] == "SELL":
-                            color = "background-color: #ffc7ce"  # light red
-                        return [color] * len(row)
-
-                    trades_df.style.apply(style_trades, axis=1).to_excel(
-                        writer, sheet_name="Trading History", index=False
-                    )
-
-                # Portfolio History Sheet
-                if not analysis["portfolio_history"].empty:
-                    analysis["portfolio_history"].to_excel(
-                        writer, sheet_name="Portfolio History", index=False
-                    )
-
-            print(f"Successfully exported backtest results to {filename}")
-        except ImportError:
-            print("Please install 'openpyxl' to export to Excel: pip install openpyxl")
-        except Exception as e:
-            print(f"An error occurred while exporting to Excel: {e}")
+            # --- Final Positions Sheet ---
+            if analysis["final_positions"]:
+                pd.DataFrame(analysis["final_positions"]).to_excel(
+                    writer, sheet_name="Final Positions", index=False
+                )
+        print(f"Backtest results successfully exported to {filename}")

@@ -711,10 +711,6 @@ def main():
         logger.error(f"Crawler failed: {str(e)}")
         # crawler.send_crawler_notification(categories, args.email, success=False)
         sys.exit(1)
-    except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
-        # crawler.send_crawler_notification(categories, args.email, success=False)
-        sys.exit(1)
 
 
 if __name__ == "__main__":
