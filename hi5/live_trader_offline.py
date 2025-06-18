@@ -254,7 +254,7 @@ class OfflineTradingPlanner:
         smtp_port=None,
         smtp_username=None,
         smtp_password=None,
-        test_dates=None,
+        test_dates: Optional[List[datetime.datetime]] = None,
         engine="local",
         bucket_name=None,
         blob_name=None,
@@ -263,11 +263,7 @@ class OfflineTradingPlanner:
         gdocs_document_id=None,
     ):
         self.recipient_email = recipient_email
-        self.test_dates = (
-            test_dates
-            if test_dates
-            else [datetime.datetime.now() - datetime.timedelta(days=1)]
-        )
+        self.test_dates = test_dates
         self.engine = engine
         self.project_id = project_id
 
@@ -492,14 +488,14 @@ class OfflineTradingPlanner:
 
         if not self.state.third_exec:
             extreme_query = f"""
-            SELECT ma50_ratio
+            SELECT ma50_ratio, ma50_above, ma50_below
             FROM `{self.project_id}.market_data.market_breadth`
             WHERE date = DATE('{trading_day.strftime('%Y-%m-%d')}')
             """
             extreme_result = self.bq_client.query(extreme_query).result()
             for row in extreme_result:
                 trigger_context["ma50_ratio"] = row.ma50_ratio
-                if row.ma50_ratio <= 0.15:
+                if row.ma50_ratio <= 0.15 and row.ma50_above > 0 and row.ma50_below > 0:
                     reason = f"Human extreme condition triggered: MA50 ratio = {row.ma50_ratio:.2%}"
                     multiplier = 5 if portfolio_value < 500000 else 1
                     investment_amount = base_investment_amount * multiplier
@@ -752,6 +748,25 @@ def main():
     parser.add_argument("--gdocs-document-id", help="ID of the Google Doc to update.")
     args = parser.parse_args()
 
+    try:
+        with open(args.gcp_config, "r") as f:
+            gcp_config = json.load(f)
+        if not gcp_config.get("project_id") or not gcp_config.get("credentials_path"):
+            raise ValueError(
+                "GCP config must contain 'project_id' and 'credentials_path'"
+            )
+    except (FileNotFoundError, ValueError) as e:
+        print(f"Error with GCP config file {args.gcp_config}: {e}")
+        return
+
+    # Initialize BigQuery client to fetch last trading day if needed
+    credentials = service_account.Credentials.from_service_account_file(
+        gcp_config["credentials_path"]
+    )
+    bq_client = bigquery.Client(
+        credentials=credentials, project=gcp_config["project_id"]
+    )
+
     test_dates = []
     if args.test_date:
         try:
@@ -770,19 +785,40 @@ def main():
         except ValueError as e:
             print(f"Error parsing --test-date: {e}")
             return
+    else:
+        # If no date is provided, fetch the last trading day from BigQuery
+        print("No --test-date provided. Fetching last trading day from BigQuery...")
+        query = f"""
+        SELECT MAX(date) as last_trading_day
+        FROM `{gcp_config['project_id']}.market_data.marketing`
+        WHERE ticker = 'RSP' and volume > 0
+        """
+        try:
+            result = bq_client.query(query).result()
+            row = next(result, None)
+            if row and row.last_trading_day:
+                last_trading_day = row.last_trading_day
+                test_dates = [
+                    datetime.datetime.combine(last_trading_day, datetime.time())
+                ]
+                print(
+                    f"Using last available trading day: {last_trading_day.strftime('%Y-%m-%d')}"
+                )
+            else:
+                raise ValueError("Could not retrieve last trading day from BigQuery.")
+        except Exception as e:
+            print(f"Error: Failed to fetch last trading day. {e}")
+            return
+
+    if not test_dates:
+        print("Error: No test dates could be determined.")
+        return
+
+    print(
+        f"Planning for: {test_dates[0].strftime('%Y-%m-%d')} to {test_dates[-1].strftime('%Y-%m-%d')}"
+    )
 
     smtp_config = load_smtp_config(args.smtp_config) if args.email else {}
-
-    try:
-        with open(args.gcp_config, "r") as f:
-            gcp_config = json.load(f)
-        if not gcp_config.get("project_id") or not gcp_config.get("credentials_path"):
-            raise ValueError(
-                "GCP config must contain 'project_id' and 'credentials_path'"
-            )
-    except (FileNotFoundError, ValueError) as e:
-        print(f"Error with GCP config file {args.gcp_config}: {e}")
-        return
 
     config = {
         "recipient_email": args.email,
